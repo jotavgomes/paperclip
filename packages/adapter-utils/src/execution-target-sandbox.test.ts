@@ -45,6 +45,7 @@ import {
 } from "./acpx-engine/startup-timing.js";
 import {
   DuplexAggregateByteLedger,
+  DUPLEX_AGGREGATE_TOKEN_OWNERS,
   DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED,
 } from "./duplex-aggregate-byte-ledger.js";
 import { createSandboxRunLogTailFactory, type SandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
@@ -53,6 +54,7 @@ import { shellQuote } from "./ssh.js";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
   DEFAULT_MAX_DUPLEX_FRAME_BYTES,
+  DuplexFrameDecoder,
   DUPLEX_FRAME_VERSION,
   decodeDuplexLine,
   encodeDuplexFrame,
@@ -5143,11 +5145,16 @@ interface EmbeddedDecodeResult {
 interface EmbeddedCodec {
   encodeDuplexFrame: (frame: unknown) => string;
   decodeDuplexLine: (line: string | Buffer) => EmbeddedDecodeResult;
-  DuplexFrameDecoder: new (options?: { maxFrameBytes?: number }) => {
+  DuplexFrameDecoder: new (options?: { maxFrameBytes?: number; maxAggregateBytes?: number }) => {
     push: (chunk: Buffer) => EmbeddedDecodeResult[];
+    scope: string;
+    bytesInUse: number;
+    aggregateRejections: number;
   };
   DUPLEX_FRAME_VERSION: number;
   DEFAULT_MAX_DUPLEX_FRAME_BYTES: number;
+  DUPLEX_DECODER_SCOPE: string;
+  DEFAULT_MAX_DUPLEX_DECODER_BYTES: number;
 }
 
 type ExpectedVectorResult = { frame: unknown } | { error: string };
@@ -5384,7 +5391,7 @@ describe("sandbox duplex gateway", () => {
 
   it("embedded gateway codec passes every vector in the shared fixture", async () => {
     const codecFactory = new Function(
-      `${getSandboxDuplexGatewayCodecSource()}\nreturn { encodeDuplexFrame, decodeDuplexLine, DuplexFrameDecoder, DUPLEX_FRAME_VERSION, DEFAULT_MAX_DUPLEX_FRAME_BYTES };`,
+      `${getSandboxDuplexGatewayCodecSource()}\nreturn { encodeDuplexFrame, decodeDuplexLine, DuplexFrameDecoder, DUPLEX_FRAME_VERSION, DEFAULT_MAX_DUPLEX_FRAME_BYTES, DUPLEX_DECODER_SCOPE, DEFAULT_MAX_DUPLEX_DECODER_BYTES };`,
     ) as unknown as () => EmbeddedCodec;
     const codec = codecFactory();
 
@@ -5450,6 +5457,61 @@ describe("sandbox duplex gateway", () => {
       expect(decoded.ok).toBe(true);
       expect(decoded.frame).toEqual(want.frame);
     }
+  });
+
+  it("bounds the sandbox decoder with a separate sandbox_process scope, distinct from the host ledger scope", () => {
+    // The generated gateway runs in a separate operating-system process, so its
+    // decoder cannot share the host aggregate byte ledger. It enforces a separate
+    // local cap under the `sandbox_process` scope. This test wraps the embedded
+    // source and the host decoder, then proves the two scopes never overlap and the
+    // sandbox cap fails closed.
+    const codecFactory = new Function(
+      `${getSandboxDuplexGatewayCodecSource()}\nreturn { encodeDuplexFrame, decodeDuplexLine, DuplexFrameDecoder, DUPLEX_FRAME_VERSION, DEFAULT_MAX_DUPLEX_FRAME_BYTES, DUPLEX_DECODER_SCOPE, DEFAULT_MAX_DUPLEX_DECODER_BYTES };`,
+    ) as unknown as () => EmbeddedCodec;
+    const codec = codecFactory();
+
+    // The sandbox scope is the fixed `sandbox_process` label.
+    expect(codec.DUPLEX_DECODER_SCOPE).toBe("sandbox_process");
+    expect(codec.DEFAULT_MAX_DUPLEX_DECODER_BYTES).toBeGreaterThan(codec.DEFAULT_MAX_DUPLEX_FRAME_BYTES);
+    // The two scopes are distinct: the host owner set never carries the sandbox
+    // scope, so the sandbox counter can never map to a host aggregate token.
+    expect((DUPLEX_AGGREGATE_TOKEN_OWNERS as readonly string[]).includes("sandbox_process")).toBe(false);
+
+    // The sandbox decoder tracks its own `sandbox_process` counter. A frame under
+    // the cap charges the local counter, and the counter returns to zero once the
+    // frame drains.
+    const sandboxDecoder = new codec.DuplexFrameDecoder({ maxAggregateBytes: 64 });
+    expect(sandboxDecoder.scope).toBe("sandbox_process");
+    const partial = sandboxDecoder.push(Buffer.from('{"version":1,', "utf8"));
+    expect(partial).toEqual([]);
+    expect(sandboxDecoder.bytesInUse).toBe(Buffer.byteLength('{"version":1,', "utf8"));
+    sandboxDecoder.push(Buffer.from('"type":"heartbeat"}\n', "utf8"));
+    expect(sandboxDecoder.bytesInUse).toBe(0);
+
+    // A chunk over the local cap fails closed. The decoder retains nothing, reports
+    // the aggregate rejection, and increments only its local `sandbox_process`
+    // counter.
+    const cappedDecoder = new codec.DuplexFrameDecoder({ maxAggregateBytes: 8 });
+    const overCap = cappedDecoder.push(Buffer.from("x".repeat(64), "utf8"));
+    expect(overCap.length).toBe(1);
+    const rejection = overCap[0];
+    expect(rejection.ok).toBe(false);
+    expect(rejection.error?.code).toBe("aggregate_bytes_exceeded");
+    expect(cappedDecoder.bytesInUse).toBe(0);
+    expect(cappedDecoder.aggregateRejections).toBe(1);
+
+    // The host decoder charges the host aggregate byte ledger under the
+    // `decoder_buffer` owner. It never uses the sandbox scope. This proves the two
+    // implementations use distinct scopes: the host uses the injected ledger; the
+    // sandbox uses its local counter.
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 1024 });
+    const hostDecoder = new DuplexFrameDecoder({ aggregateByteLedger: ledger });
+    hostDecoder.push(Buffer.from('{"version":1,', "utf8"));
+    expect(ledger.bytesInUse).toBe(Buffer.byteLength('{"version":1,', "utf8"));
+    expect(ledger.liveTokenCount).toBeGreaterThan(0);
+    hostDecoder.dispose();
+    expect(ledger.bytesInUse).toBe(0);
+    expect(ledger.liveTokenCount).toBe(0);
   });
 
   it("returns the same HTTP response as the file gateway for a forwarded request", async () => {

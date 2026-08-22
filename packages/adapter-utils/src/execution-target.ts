@@ -29,6 +29,7 @@ import {
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
+  DEFAULT_SANDBOX_DUPLEX_DECODER_MAX_BYTES,
   SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   sandboxCallbackBridgeDirectories,
@@ -3185,6 +3186,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         PAPERCLIP_BRIDGE_PORT: String(assignedPort),
         PAPERCLIP_BRIDGE_NONCE: nonce,
         PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(maxBodyBytes),
+        // The separate sandbox-process raw-decoder cap. The generated gateway runs
+        // in a different operating-system process, so it cannot share the host
+        // aggregate byte ledger. It enforces this cap locally under the
+        // `sandbox_process` scope, and the provider memory allocation bounds it.
+        PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES: String(DEFAULT_SANDBOX_DUPLEX_DECODER_MAX_BYTES),
       };
       const command = buildDuplexGatewayLaunchArgv({
         shellCommand,
