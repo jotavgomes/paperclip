@@ -3243,6 +3243,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
                 `[paperclip] Sandbox duplex channel lost (${typedDuplexLossReason(record.reason)}). The run fails.\n`,
               );
             },
+            // Inject the one host-process aggregate byte ledger. The broker
+            // reserves the retained request-frame, request-payload, and no-replay
+            // set-entry bytes against it, so the aggregate retained bytes across all
+            // live routes stay under the ceiling. It is the same object the
+            // response-body reader reads off the stamped target above.
+            duplexAggregateByteLedger,
           });
         } catch {
           // The broker construction failed, so no broker owns the channel. Close
