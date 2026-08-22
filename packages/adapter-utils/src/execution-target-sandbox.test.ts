@@ -66,10 +66,14 @@ import {
 } from "./duplex-bridge-broker.js";
 import {
   createDuplexTelemetry,
+  DUPLEX_AGGREGATE_BYTE_LEDGER_METRIC_NAMES,
+  DUPLEX_COUNTER_AGGREGATE_BYTE_ACCOUNTING_UNDERFLOW_TOTAL,
+  DUPLEX_COUNTER_AGGREGATE_BYTE_RESERVATION_REJECTIONS_TOTAL,
   DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL,
   DUPLEX_COUNTER_FALLBACK_TOTAL,
   DUPLEX_COUNTER_LOSS_TOTAL,
   DUPLEX_DIMENSION_KEYS,
+  DUPLEX_GAUGE_AGGREGATE_BYTES_IN_USE,
   DUPLEX_SPAN_CHANNEL_OPEN,
   DUPLEX_SPAN_REQUEST,
   DUPLEX_TRANSPORT_EVENT,
@@ -3581,6 +3585,24 @@ describe("sandbox adapter execution targets", () => {
       "loss_class",
       "loss_reason",
     ]);
+  });
+
+  it("pins the exact aggregate byte ledger metric names", () => {
+    // The aggregate byte ledger metric names are closed. This test locks the
+    // exact set, so a new gauge or counter name needs an explicit change here.
+    // Each record carries only closed constant dimensions and no dynamic label.
+    expect([...DUPLEX_AGGREGATE_BYTE_LEDGER_METRIC_NAMES]).toEqual([
+      "sandbox_duplex_aggregate_bytes_in_use",
+      "sandbox_duplex_aggregate_byte_reservation_rejections_total",
+      "sandbox_duplex_aggregate_byte_accounting_underflow_total",
+    ]);
+    expect(DUPLEX_GAUGE_AGGREGATE_BYTES_IN_USE).toBe("sandbox_duplex_aggregate_bytes_in_use");
+    expect(DUPLEX_COUNTER_AGGREGATE_BYTE_RESERVATION_REJECTIONS_TOTAL).toBe(
+      "sandbox_duplex_aggregate_byte_reservation_rejections_total",
+    );
+    expect(DUPLEX_COUNTER_AGGREGATE_BYTE_ACCOUNTING_UNDERFLOW_TOTAL).toBe(
+      "sandbox_duplex_aggregate_byte_accounting_underflow_total",
+    );
   });
 
   it("records a duplex request span with latency and the fixed dimension keys", async () => {
