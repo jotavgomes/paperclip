@@ -3876,6 +3876,7 @@ describe("sandbox adapter execution targets", () => {
         "ready_nonce_mismatch",
         "ready_timeout",
         "contaminated",
+        "aggregate_bytes_exceeded",
       ];
       expect(approvedReasons).toContain(fallback?.dimensions.fallback_reason);
       expect(fallback?.dimensions).toMatchObject({ transport: "file", outcome: "error" });
@@ -4383,6 +4384,128 @@ describe("sandbox adapter execution targets", () => {
       expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
       expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
     } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("fails the readiness handshake closed when the host aggregate ledger has no room for the pre-READY buffer", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-ready-ledger-full-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // The host stamps one process-owned aggregate byte ledger on the sandbox
+    // target at a tiny ceiling. The fake gateway sends a pre-READY blob larger
+    // than the ceiling, so the gate cannot reserve the blob bytes. The gate fails
+    // closed: it retains nothing, records the aggregate fallback reason, and falls
+    // back to the file bridge. The blob is smaller than the readiness buffer cap,
+    // so the aggregate ledger, not the buffer cap, drives the failure.
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 256 });
+    const preReadyBlob = "x".repeat(4_096);
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw(preReadyBlob);
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+      duplexAggregateByteLedger: ledger,
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-ready-ledger-full",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      // A long readiness timeout, so the aggregate ledger, not the timeout, drives
+      // the failure.
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The aggregate rejection drove the failure, so the file bridge serves.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("aggregate_bytes_exceeded");
+      // The gate retained nothing after the rejection, so the aggregate gauge and
+      // the live-token registry both return to zero.
+      expect(ledger.bytesInUse).toBe(0);
+      expect(ledger.liveTokenCount).toBe(0);
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("charges the pre-READY buffer against the injected host ledger and releases it when readiness passes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-ready-ledger-ok-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // The host stamps one process-owned aggregate byte ledger on the sandbox
+    // target at a generous ceiling. The fake gateway sends one pre-READY noise
+    // line, then the valid READY frame. The gate charges the noise bytes against
+    // the injected ledger, passes readiness, and releases the pre-READY tokens.
+    // The broker's frame decoder re-charges any post-READY bytes, so the ledger
+    // returns to zero after the handshake.
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 1024 * 1024 });
+    const reserveSpy = vi.spyOn(ledger, "reserve");
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw("pty-echo-noise");
+      ctx.emitFrame({ version: 1, type: "ready", nonce: ctx.nonce });
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+      duplexAggregateByteLedger: ledger,
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-ready-ledger-ok",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      // Readiness passed, so the duplex transport serves.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      // The gate charged the pre-READY noise against the exact injected ledger, so
+      // the identity holds at this seam.
+      expect(reserveSpy).toHaveBeenCalledWith("readiness_buffer", expect.any(Number));
+      // The gate released every readiness-buffer token on settle, so the aggregate
+      // gauge and the live-token registry both return to zero.
+      await waitForCondition(
+        () => ledger.bytesInUse === 0 && ledger.liveTokenCount === 0,
+        "the readiness gate to release every pre-READY token",
+        4000,
+      );
+      expect(ledger.bytesInUse).toBe(0);
+      expect(ledger.liveTokenCount).toBe(0);
+    } finally {
+      reserveSpy.mockRestore();
       await bridge?.stop();
       await api.close();
     }

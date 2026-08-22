@@ -2478,7 +2478,8 @@ type DuplexReadinessFailure =
   | "protocol_contamination"
   | "nonce_mismatch"
   | "channel_exit"
-  | "timeout";
+  | "timeout"
+  | "aggregate_bytes_exceeded";
 
 /** The outcome of the duplex readiness handshake. */
 type DuplexReadinessResult =
@@ -2500,6 +2501,8 @@ function duplexReadinessFallbackReason(reason: DuplexReadinessFailure): DuplexFa
       return "ready_timeout";
     case "channel_exit":
       return "ready_invalid";
+    case "aggregate_bytes_exceeded":
+      return "aggregate_bytes_exceeded";
   }
 }
 
@@ -2642,10 +2645,27 @@ interface DuplexReadinessGate {
 
 function createDuplexReadinessGate(
   channel: CommandManagedDuplexChannel,
-  options: { nonce: string; timeoutMs: number },
+  options: {
+    nonce: string;
+    timeoutMs: number;
+    // The one host-process aggregate byte ledger. The gate charges the untrusted
+    // pre-READY buffer bytes against it, so a pre-READY flood counts toward the
+    // aggregate ceiling across all live routes. A gate with no ledger stays inert
+    // for this seam. The gate holds the same object every other host retention
+    // site holds, so the aggregate identity holds at this seam.
+    ledger?: DuplexAggregateByteLedger | null;
+  },
 ): DuplexReadinessGate {
+  const ledger = options.ledger ?? null;
   let settled = false;
   let readyOk = false;
+  // Every readiness-buffer reservation token the gate holds for the pre-READY
+  // bytes. The gate releases each token one time when it settles. On a failed
+  // handshake the gate drops the buffer, so the release frees the untrusted
+  // bytes. On READY the gate discards the pre-READY prefix and hands the bounded
+  // remainder to the broker, and the frame decoder re-charges those bytes as it
+  // pushes them, so the release here leaves no double charge.
+  const retainedTokens: ReservationToken[] = [];
   // The raw bytes the host reads before the READY frame completes. The buffer is
   // append-only, so the O(1) cap check on `buffer.length` stays valid.
   let buffer = "";
@@ -2674,6 +2694,16 @@ function createDuplexReadinessGate(
     settled = true;
     clearTimeout(timer);
     if (result.ok) readyOk = true;
+    // Release every readiness-buffer token exactly once. The gate no longer owns
+    // the pre-READY bytes: a failed handshake drops the buffer, and a passed
+    // handshake hands the remainder to the broker, which re-charges it on the
+    // frame decoder.
+    if (ledger) {
+      for (const token of retainedTokens) {
+        ledger.release(token);
+      }
+      retainedTokens.length = 0;
+    }
     resolveReady(result);
   }
 
@@ -2692,6 +2722,18 @@ function createDuplexReadinessGate(
       // sending bytes until the host closes it. Drop them, so a failed handshake
       // never grows the buffer after the gate settles.
       return;
+    }
+    // Reserve the exact UTF-8 bytes of this chunk against the aggregate ledger
+    // before the gate retains it. The pre-READY buffer holds untrusted bytes, so
+    // a flood counts toward the process aggregate ceiling. A rejection fails
+    // closed: the gate retains nothing more and falls back to the file bridge.
+    if (ledger) {
+      const token = ledger.reserve("readiness_buffer", Buffer.byteLength(chunk, "utf8"));
+      if (!token) {
+        finish({ ok: false, reason: "aggregate_bytes_exceeded" });
+        return;
+      }
+      retainedTokens.push(token);
     }
     // Append the new bytes and continue the newline search from `scanFrom`, the
     // first index not yet examined. Each code unit is read at most one time for
@@ -3174,7 +3216,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     }
 
     if (channel) {
-      const gate = createDuplexReadinessGate(channel, { nonce, timeoutMs: readinessTimeoutMs });
+      const gate = createDuplexReadinessGate(channel, {
+        nonce,
+        timeoutMs: readinessTimeoutMs,
+        // Inject the one host-process aggregate byte ledger, the same object the
+        // broker and the response-body reader hold. The gate charges the untrusted
+        // pre-READY buffer against it, so the aggregate identity holds at this seam.
+        ledger: duplexAggregateByteLedger,
+      });
       const readiness = await gate.ready;
       if (!readiness.ok) {
         // Fail closed. Close the partial channel inside a bounded budget, then

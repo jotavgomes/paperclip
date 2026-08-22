@@ -96,6 +96,9 @@ export type DuplexOutcomeValue = "ok" | "error";
  * stage: the process-scoped route ceiling was full (`route_busy`), the entrypoint
  * sync failed (`entrypoint_sync_failed`), the broker construction failed
  * (`broker_construction_failed`), or the channel open failed (`channel_open_failed`).
+ * The `aggregate_bytes_exceeded` reason names a readiness handshake the host fell
+ * back because the process aggregate byte ceiling had no room for the readiness
+ * buffer.
  */
 export type DuplexFallbackReason =
   | "gate_off"
@@ -107,7 +110,8 @@ export type DuplexFallbackReason =
   | "ready_invalid"
   | "ready_nonce_mismatch"
   | "ready_timeout"
-  | "contaminated";
+  | "contaminated"
+  | "aggregate_bytes_exceeded";
 
 /** The class of a terminal loss, relative to the first request dispatch. */
 export type DuplexLossClass = "pre_dispatch" | "post_dispatch";

@@ -73,6 +73,8 @@ export const MIN_HOST_PROCESS_MEMORY_BYTES_FOR_DUPLEX = 2 * 1024 * 1024 * 1024;
  *   - `seen_request_id`: one entry of the broker no-replay request-id set.
  *   - `decoder_buffer`: the raw partial-frame bytes the host frame decoder retains
  *     between chunks, plus the peak replacement buffer it allocates on concat.
+ *   - `readiness_buffer`: the raw untrusted bytes the readiness gate retains before
+ *     the READY frame completes, before the broker binds and the decoder takes over.
  */
 export const DUPLEX_AGGREGATE_TOKEN_OWNERS = [
   "pre_bind_event",
@@ -83,6 +85,7 @@ export const DUPLEX_AGGREGATE_TOKEN_OWNERS = [
   "response_body",
   "seen_request_id",
   "decoder_buffer",
+  "readiness_buffer",
 ] as const;
 
 /** One owner label from the closed {@link DUPLEX_AGGREGATE_TOKEN_OWNERS} set. */
