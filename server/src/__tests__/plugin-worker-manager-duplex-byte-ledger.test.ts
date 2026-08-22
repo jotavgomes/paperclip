@@ -6,7 +6,10 @@ import {
   DuplexAggregateByteLedger,
   type DuplexAggregateByteLedgerTelemetry,
 } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
-import { createPluginWorkerHandle } from "../services/plugin-worker-manager.js";
+import {
+  createDuplexRouteSlotController,
+  createPluginWorkerHandle,
+} from "../services/plugin-worker-manager.js";
 
 // This suite proves the plugin worker manager charges every retained duplex route
 // representation against the injected aggregate byte ledger, and releases each
@@ -174,6 +177,172 @@ describe("plugin worker manager duplex aggregate byte ledger", () => {
     }
     expect(ledger.bytesInUse).toBe(0);
     expect(ledger.liveTokenCount).toBe(0);
+    expect(telemetry.underflows).toBe(0);
+  });
+});
+
+// A telemetry surface that also tracks the peak gauge value. A test asserts the
+// peak never passes the ceiling, so it proves aggregate admission stops at the
+// ceiling instead of overshooting it.
+function peakTrackingTelemetry(): DuplexAggregateByteLedgerTelemetry & {
+  gauge: number;
+  peak: number;
+  rejections: number;
+  underflows: number;
+} {
+  const state = {
+    gauge: 0,
+    peak: 0,
+    rejections: 0,
+    underflows: 0,
+    setBytesInUse(bytes: number) {
+      state.gauge = bytes;
+      if (bytes > state.peak) state.peak = bytes;
+    },
+    recordReservationRejection() {
+      state.rejections += 1;
+    },
+    recordAccountingUnderflow() {
+      state.underflows += 1;
+    },
+  };
+  return state;
+}
+
+// The exact raw byte count of one buffered chunk each route retains.
+const LOAD_CHUNK_BYTES = 8;
+const LOAD_CHUNK = "x".repeat(LOAD_CHUNK_BYTES);
+
+describe("plugin worker manager duplex aggregate byte ledger load across workers", () => {
+  it("stops aggregate byte admission at the ceiling across many routes and workers while the route-count controller stays open", async () => {
+    const telemetry = peakTrackingTelemetry();
+    // The ceiling holds exactly six eight-byte buffered chunks.
+    const fittingRoutes = 6;
+    const ceilingBytes = fittingRoutes * LOAD_CHUNK_BYTES;
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes, telemetry });
+    // The route-count controller has ample room, so the byte ledger binds first.
+    const routeSlots = createDuplexRouteSlotController(100);
+    const handleCount = 3;
+    const routesPerHandle = 3;
+    const totalRoutes = handleCount * routesPerHandle;
+    const rejectedRoutes = totalRoutes - fittingRoutes;
+    const handles: Array<ReturnType<typeof makeDuplexHandle>> = [];
+    try {
+      for (let h = 0; h < handleCount; h += 1) {
+        const handle = makeDuplexHandle({
+          duplexAggregateByteLedger: ledger,
+          duplexRouteSlots: routeSlots,
+        });
+        await handle.start();
+        handles.push(handle);
+      }
+      // Open every route in order. Each worker batches one data chunk with the open
+      // reply, so the host holds the chunk as a pre-bind event and reserves its exact
+      // raw bytes before the route binds. No listener attaches, so a bound route holds
+      // the chunk. The first six chunks fit the ceiling. Each later reservation passes
+      // the ceiling, so the ledger rejects it and the route fails closed with the open
+      // marker (not the route-busy marker), because the route-count controller has room.
+      let opened = 0;
+      let failedClosed = 0;
+      for (let h = 0; h < handleCount; h += 1) {
+        for (let r = 0; r < routesPerHandle; r += 1) {
+          try {
+            await handles[h].openDuplexChannel(
+              duplexOpenInput({
+                workerSessionId: `ws-${h}-${r}`,
+                batchWithOpenReply: true,
+                data: [{ chunk: LOAD_CHUNK }],
+              }),
+            );
+            opened += 1;
+          } catch (err) {
+            // A byte-ceiling rejection fails the route closed with the open marker.
+            // The route-count controller had room, so this is never the route-busy
+            // marker.
+            expect(String(err)).toContain("DUPLEX_CHANNEL_OPEN_FAILED");
+            expect(String(err)).not.toContain("DUPLEX_CHANNEL_ROUTE_BUSY");
+            failedClosed += 1;
+          }
+        }
+      }
+      // Six routes bound and hold their bytes; three failed closed at the ceiling.
+      expect(opened).toBe(fittingRoutes);
+      expect(failedClosed).toBe(rejectedRoutes);
+      expect(opened + failedClosed).toBe(totalRoutes);
+      // The aggregate gauge holds at the ceiling and the ledger recorded one rejection
+      // per over-ceiling route.
+      await vi.waitFor(() => {
+        expect(telemetry.rejections).toBe(rejectedRoutes);
+        expect(ledger.bytesInUse).toBe(ceilingBytes);
+        expect(ledger.liveTokenCount).toBe(fittingRoutes);
+      });
+      // The gauge never passed the ceiling, so admission stopped at the ceiling and
+      // never overshot it.
+      expect(telemetry.peak).toBe(ceilingBytes);
+    } finally {
+      for (const handle of handles) await handle.stop().catch(() => undefined);
+    }
+    // Every worker exit sweep released its buffered tokens once, so the ledger ends
+    // at zero with no accounting defect.
+    expect(ledger.bytesInUse).toBe(0);
+    expect(ledger.liveTokenCount).toBe(0);
+    expect(telemetry.underflows).toBe(0);
+  });
+
+  it("still bounds the route count for fixed per-route overhead when the byte ceiling has ample room", async () => {
+    const telemetry = peakTrackingTelemetry();
+    // A large byte ceiling, so retained bytes never bind admission.
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 1 << 20, telemetry });
+    // The route-count controller holds two slots for the whole process.
+    const routeSlots = createDuplexRouteSlotController(2);
+    const handleA = makeDuplexHandle({
+      duplexAggregateByteLedger: ledger,
+      duplexRouteSlots: routeSlots,
+    });
+    const handleB = makeDuplexHandle({
+      duplexAggregateByteLedger: ledger,
+      duplexRouteSlots: routeSlots,
+    });
+    let opened = 0;
+    let busy = 0;
+    try {
+      await handleA.start();
+      await handleB.start();
+      // Attempt four routes across the two workers. The shared controller admits the
+      // first two and rejects the last two with the fixed route-busy error.
+      const attempts: Array<[ReturnType<typeof makeDuplexHandle>, string]> = [
+        [handleA, "ws-a1"],
+        [handleA, "ws-a2"],
+        [handleB, "ws-b1"],
+        [handleB, "ws-b2"],
+      ];
+      for (const [handle, ws] of attempts) {
+        try {
+          await handle.openDuplexChannel(
+            duplexOpenInput({ workerSessionId: ws, data: [{ chunk: "aa" }] }),
+          );
+          opened += 1;
+        } catch (err) {
+          expect(String(err)).toContain("DUPLEX_CHANNEL_ROUTE_BUSY");
+          busy += 1;
+        }
+      }
+      // The route-count controller admitted two routes and rejected the rest, so it
+      // still bounds the fixed per-route overhead on its own.
+      expect(opened).toBe(2);
+      expect(busy).toBe(2);
+      // The two open routes buffered four raw bytes, far under the byte ceiling, and
+      // the byte ledger rejected nothing.
+      await vi.waitFor(() => {
+        expect(ledger.bytesInUse).toBe(4);
+        expect(ledger.liveTokenCount).toBe(2);
+      });
+      expect(telemetry.rejections).toBe(0);
+    } finally {
+      await handleA.stop().catch(() => undefined);
+      await handleB.stop().catch(() => undefined);
+    }
+    expect(ledger.bytesInUse).toBe(0);
     expect(telemetry.underflows).toBe(0);
   });
 });
