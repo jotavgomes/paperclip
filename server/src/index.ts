@@ -801,7 +801,7 @@ export async function startServer(): Promise<StartedServer> {
   });
   const pluginWorkerManager = createPluginWorkerManager({ duplexAggregateByteLedger });
   const heartbeat = config.heartbeatSchedulerEnabled
-    ? heartbeatService(db as any, { pluginWorkerManager })
+    ? heartbeatService(db as any, { pluginWorkerManager, duplexAggregateByteLedger })
     : null;
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),

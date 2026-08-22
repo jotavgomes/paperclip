@@ -63,6 +63,7 @@ import {
   type DuplexFallbackReason,
   type DuplexTelemetryRecorder,
 } from "./duplex-telemetry.js";
+import type { DuplexAggregateByteLedger } from "./duplex-aggregate-byte-ledger.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -184,6 +185,16 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * observability surface. Absent means the safe no-op default.
    */
   duplexTelemetryRecorder?: DuplexTelemetryRecorder | null;
+  /**
+   * The process-owned aggregate byte ledger for the sandbox duplex channel. The
+   * host stamps this same object on every sandbox target on the same seam as
+   * `runner`, so one shared gauge bounds the aggregate retained bytes across all
+   * live duplex routes. The live object stays on the host and never enters the
+   * sandbox environment. The bridge passes it to the broker, the decoder, and the
+   * response-body reader. Absent means no host ledger; a non-duplex run keeps the
+   * bridge inert for this seam.
+   */
+  duplexAggregateByteLedger?: DuplexAggregateByteLedger | null;
 }
 
 export type AdapterExecutionTarget =
@@ -425,6 +436,20 @@ export function adapterExecutionTargetDuplexTelemetryRecorder(
 ): DuplexTelemetryRecorder | null {
   return target?.kind === "remote" && target.transport === "sandbox"
     ? target.duplexTelemetryRecorder ?? null
+    : null;
+}
+
+/**
+ * Read the injected aggregate byte ledger off a target. Only a sandbox target
+ * with a ledger attached returns it. Every other target returns null, so the
+ * bridge stays inert for this seam. The reader never makes a fresh ledger, so a
+ * host duplex run always uses the one process-owned ledger the host stamped.
+ */
+export function adapterExecutionTargetDuplexAggregateByteLedger(
+  target: AdapterExecutionTarget | null | undefined,
+): DuplexAggregateByteLedger | null {
+  return target?.kind === "remote" && target.transport === "sandbox"
+    ? target.duplexAggregateByteLedger ?? null
     : null;
 }
 
