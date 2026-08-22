@@ -43,6 +43,10 @@ import {
   type StartupTraceContext,
   type StartupTracer,
 } from "./acpx-engine/startup-timing.js";
+import {
+  DuplexAggregateByteLedger,
+  DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED,
+} from "./duplex-aggregate-byte-ledger.js";
 import { createSandboxRunLogTailFactory, type SandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
 import { runChildProcess } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
@@ -2676,6 +2680,155 @@ describe("sandbox adapter execution targets", () => {
         auth: "Bearer real-run-jwt",
         runId: "run-bridge-safe-limit",
       }]);
+    } finally {
+      await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  it("charges the response-body bytes against the host aggregate ledger and releases every token on success", async () => {
+    // The host stamps one process-owned aggregate byte ledger on the sandbox
+    // target. The forward response-body reader charges its retained bytes against
+    // that ledger. A successful read charges the chunk bytes and the
+    // concatenation buffer, then releases every token, so the ledger returns to
+    // zero after the forward completes.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-ledger-ok-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const responseBody = JSON.stringify({ id: "issue-1" });
+    const apiServer = createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(responseBody, "utf8")),
+      });
+      res.end(responseBody);
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 1024 * 1024 });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      duplexAggregateByteLedger: ledger,
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-bridge-ledger-ok",
+      target,
+      runtimeRootDir,
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${address.port}`,
+      maxBodyBytes: 512,
+    });
+    try {
+      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/issues/issue-1`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+        },
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ id: "issue-1" });
+      // The reader released every token, so the aggregate gauge and the live-token
+      // registry both return to zero.
+      expect(ledger.bytesInUse).toBe(0);
+      expect(ledger.liveTokenCount).toBe(0);
+    } finally {
+      await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  it("fails a response-body read closed when the host aggregate ledger has no room and retains no bytes", async () => {
+    // The aggregate ledger sits at a tiny ceiling, so a response body larger than
+    // the ceiling cannot reserve its bytes. The reader fails closed: it cancels
+    // the stream reader, retains nothing, and reports the fixed marker. The safe
+    // GET maps the marker to a retryable 502. The ledger returns to zero, because
+    // the reader released the tokens it held before the rejection.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-ledger-full-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    // The body sits under the per-request size limit but over the aggregate
+    // ceiling, so the aggregate ledger, not the per-request limit, rejects it.
+    const responseBody = "x".repeat(256);
+    const apiServer = createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(responseBody, "utf8")),
+      });
+      res.end(responseBody);
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+
+    const ledger = new DuplexAggregateByteLedger({ ceilingBytes: 8 });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+      duplexAggregateByteLedger: ledger,
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-bridge-ledger-full",
+      target,
+      runtimeRootDir,
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${address.port}`,
+      maxBodyBytes: 4096,
+    });
+    try {
+      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/issues/issue-1`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+        },
+      });
+
+      // The safe GET maps the aggregate rejection to a retryable 502 with no
+      // indeterminate marker. The body carries only the fixed rejection marker.
+      expect(response.status).toBe(502);
+      expect(response.headers.get("x-paperclip-bridge-outcome")).toBeNull();
+      await expect(response.json()).resolves.toEqual({
+        error: DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED,
+      });
+      // The reader released the tokens it held before the rejection, so the
+      // aggregate gauge and the live-token registry both return to zero.
+      expect(ledger.bytesInUse).toBe(0);
+      expect(ledger.liveTokenCount).toBe(0);
     } finally {
       await bridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));

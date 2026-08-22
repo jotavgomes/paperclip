@@ -63,7 +63,11 @@ import {
   type DuplexFallbackReason,
   type DuplexTelemetryRecorder,
 } from "./duplex-telemetry.js";
-import type { DuplexAggregateByteLedger } from "./duplex-aggregate-byte-ledger.js";
+import {
+  DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED,
+  type DuplexAggregateByteLedger,
+  type ReservationToken,
+} from "./duplex-aggregate-byte-ledger.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -1493,7 +1497,27 @@ function bridgeResponseBodyLimitError(maxBodyBytes: number): Error {
   return new Error(`Bridge response body exceeded the configured size limit of ${maxBodyBytes} bytes.`);
 }
 
-async function readBridgeForwardResponseBody(response: Response, maxBodyBytes: number): Promise<string> {
+/**
+ * Read the forward response body into a string. The reader bounds the body with
+ * two controls. The per-request `maxBodyBytes` limit rejects a body larger than
+ * the configured per-request ceiling. The optional host aggregate byte ledger
+ * bounds the retained bytes across all live routes.
+ *
+ * The reader charges the ledger for every retained buffer before it allocates
+ * that buffer. It reserves the exact chunk bytes before it copies a chunk into a
+ * retained `Buffer`. It reserves the concatenation buffer before it allocates it.
+ * A reservation that would pass the aggregate ceiling returns no token; the
+ * reader retains nothing more, cancels the stream reader, and throws the fixed
+ * marker {@link DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED}. The `finally` releases
+ * every token exactly one time, so the reader charges the retained bytes only
+ * while the raw buffers live and never leaves a token held after it returns or
+ * throws.
+ */
+async function readBridgeForwardResponseBody(
+  response: Response,
+  maxBodyBytes: number,
+  ledger?: DuplexAggregateByteLedger | null,
+): Promise<string> {
   const rawContentLength = response.headers.get("content-length");
   if (rawContentLength) {
     const contentLength = Number.parseInt(rawContentLength, 10);
@@ -1508,19 +1532,54 @@ async function readBridgeForwardResponseBody(response: Response, maxBodyBytes: n
 
   const reader = response.body.getReader();
   const chunks: Buffer[] = [];
+  // Every response-body reservation token the reader holds. The `finally` block
+  // releases each token one time, so a return, a size error, an aggregate
+  // rejection, and a read error all release every token.
+  const tokens: ReservationToken[] = [];
   let totalBytes = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    totalBytes += value.byteLength;
-    if (totalBytes > maxBodyBytes) {
-      await reader.cancel().catch(() => undefined);
-      throw bridgeResponseBodyLimitError(maxBodyBytes);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunkBytes = value.byteLength;
+      totalBytes += chunkBytes;
+      if (totalBytes > maxBodyBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw bridgeResponseBodyLimitError(maxBodyBytes);
+      }
+      // Reserve the exact chunk bytes before the host copies the chunk into a
+      // retained buffer. A rejection fails closed: cancel the stream reader and
+      // report the fixed marker; the reader retains nothing more.
+      if (ledger) {
+        const token = ledger.reserve("response_body", chunkBytes);
+        if (!token) {
+          await reader.cancel().catch(() => undefined);
+          throw new Error(DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED);
+        }
+        tokens.push(token);
+      }
+      chunks.push(Buffer.from(value));
     }
-    chunks.push(Buffer.from(value));
+    // Reserve the concatenation buffer before the reader allocates it. The
+    // concatenation buffer is a second copy of the body bytes that lives next to
+    // the chunk buffers during the concatenation, so it is the peak retained
+    // allocation. A rejection fails closed with the fixed marker.
+    if (ledger && totalBytes > 0) {
+      const concatToken = ledger.reserve("response_body", totalBytes);
+      if (!concatToken) {
+        throw new Error(DUPLEX_CHANNEL_AGGREGATE_BYTES_EXCEEDED);
+      }
+      tokens.push(concatToken);
+    }
+    return Buffer.concat(chunks, totalBytes).toString("utf8");
+  } finally {
+    if (ledger) {
+      for (const token of tokens) {
+        ledger.release(token);
+      }
+    }
   }
-  return Buffer.concat(chunks, totalBytes).toString("utf8");
 }
 
 const PROCESS_SESSION_PROXY_SCRIPT = "paperclip-process-session-proxy.mjs";
@@ -2842,6 +2901,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   }
 
   const target = input.target;
+  // The process-owned aggregate byte ledger the host stamped on this sandbox
+  // target. The forward response-body reader charges its retained bytes against
+  // this one ledger, so the aggregate retained bytes across all live routes stay
+  // under the ceiling. A target with no ledger keeps the reader inert for this
+  // seam.
+  const duplexAggregateByteLedger = adapterExecutionTargetDuplexAggregateByteLedger(target);
   const onLog = input.onLog ?? (async () => {});
   const hostApiToken = input.hostApiToken?.trim() ?? "";
   if (hostApiToken.length === 0) {
@@ -2968,7 +3033,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // to a non-retryable 409 for both the file bridge and the duplex broker.
     let responseBody: string;
     try {
-      responseBody = await readBridgeForwardResponseBody(response, maxBodyBytes);
+      responseBody = await readBridgeForwardResponseBody(
+        response,
+        maxBodyBytes,
+        duplexAggregateByteLedger,
+      );
     } catch (error) {
       if (isSafeBridgeMethod(method)) {
         // The method is safe, so a retry cannot double-apply a mutation. Return a
