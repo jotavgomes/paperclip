@@ -83,6 +83,13 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  createDuplexAggregateByteLedgerTelemetry,
+  DuplexAggregateByteLedger,
+  resolveDuplexAggregateCeilingBytes,
+  type DuplexAggregateByteLedgerMetricSink,
+} from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
+import { DUPLEX_COUNTER_AGGREGATE_BYTE_ACCOUNTING_UNDERFLOW_TOTAL } from "@paperclipai/adapter-utils/duplex-telemetry";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -754,7 +761,45 @@ export async function startServer(): Promise<StartedServer> {
       databaseBackupInFlight = false;
     }
   };
-  const pluginWorkerManager = createPluginWorkerManager();
+  // The process-owned aggregate byte ledger for the sandbox duplex channel. One
+  // ledger per host process bounds the aggregate bytes that all live duplex routes
+  // retain. The route-count controller bounds only the route count, so without this
+  // ledger the per-route byte bounds multiply to many gigabytes at the maximum
+  // route count. The manager injects this same object into every worker handle, so
+  // one shared gauge bounds every host-side retention site.
+  //
+  // The optional operator override reads PAPERCLIP_MAX_AGGREGATE_DUPLEX_ROUTE_BYTES.
+  // A missing override uses the documented default. A present invalid, non-finite,
+  // zero, negative, non-integer, or unsafe value throws here and fails startup, so
+  // the ceiling never silently disables.
+  const duplexAggregateCeilingOverrideRaw =
+    process.env.PAPERCLIP_MAX_AGGREGATE_DUPLEX_ROUTE_BYTES?.trim();
+  const duplexAggregateCeilingBytes = resolveDuplexAggregateCeilingBytes(
+    duplexAggregateCeilingOverrideRaw ? Number(duplexAggregateCeilingOverrideRaw) : undefined,
+  );
+  // The server has no process metric pipeline yet, so the ledger telemetry maps to
+  // the structured logger. The gauge logs at debug. A reservation rejection logs at
+  // warn, because it marks an availability limit hit. An accounting-underflow defect
+  // logs at error, because it marks a real cleanup bug. Each record carries only the
+  // fixed metric name and the numeric value; no route, company, run, or payload
+  // value reaches a log line.
+  const duplexAggregateByteLedgerMetricSink: DuplexAggregateByteLedgerMetricSink = {
+    setGauge(name, value) {
+      logger.debug({ metric: name, value }, "duplex aggregate byte ledger gauge");
+    },
+    incrementCounter(name) {
+      if (name === DUPLEX_COUNTER_AGGREGATE_BYTE_ACCOUNTING_UNDERFLOW_TOTAL) {
+        logger.error({ metric: name }, "duplex aggregate byte ledger accounting underflow");
+        return;
+      }
+      logger.warn({ metric: name }, "duplex aggregate byte ledger reservation rejected");
+    },
+  };
+  const duplexAggregateByteLedger = new DuplexAggregateByteLedger({
+    ceilingBytes: duplexAggregateCeilingBytes,
+    telemetry: createDuplexAggregateByteLedgerTelemetry(duplexAggregateByteLedgerMetricSink),
+  });
+  const pluginWorkerManager = createPluginWorkerManager({ duplexAggregateByteLedger });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
