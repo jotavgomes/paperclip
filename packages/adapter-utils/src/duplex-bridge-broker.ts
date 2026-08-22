@@ -424,13 +424,17 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_DUPLEX_BROKER_HEARTBEAT_INTERVAL_MS;
   const closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_DUPLEX_BROKER_CLOSE_TIMEOUT_MS;
   const now = options.now ?? (() => Date.now());
-  const decoder = new DuplexFrameDecoder(
-    options.maxFrameBytes ? { maxFrameBytes: options.maxFrameBytes } : undefined,
-  );
 
   // The process-owned aggregate byte ledger, or `null` when the caller injected
   // none. When `null` the broker charges nothing and behaves as before.
   const ledger = options.duplexAggregateByteLedger ?? null;
+  // The decoder charges its retained partial-frame bytes against the same host
+  // ledger. It receives the ledger object directly, so one gauge bounds the
+  // decoder buffer with every other host retention site.
+  const decoder = new DuplexFrameDecoder({
+    ...(options.maxFrameBytes ? { maxFrameBytes: options.maxFrameBytes } : {}),
+    ...(ledger ? { aggregateByteLedger: ledger } : {}),
+  });
   // Release one token exactly one time. A `null` token or an absent ledger is a
   // no-op, so the broker never records a false accounting defect.
   const releaseToken = (token: ReservationToken | null): void => {
@@ -564,6 +568,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
       clearHeartbeat();
       clearPending();
       releaseSeenRequestIdTokens();
+      decoder.dispose();
       if (state !== "closing") setState("closed");
       return;
     }
@@ -588,6 +593,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     clearHeartbeat();
     clearPending();
     releaseSeenRequestIdTokens();
+    decoder.dispose();
     lossRecord = { reason, message, atMs: now() };
     setState("lost");
     // Log the internal reason only. The broker never writes the raw provider
@@ -1060,6 +1066,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
       clearHeartbeat();
       clearPending();
       releaseSeenRequestIdTokens();
+      decoder.dispose();
       // Send an orderly close frame. Ignore a write failure here; the broker is
       // already closing, so a dead channel needs no loss record.
       try {

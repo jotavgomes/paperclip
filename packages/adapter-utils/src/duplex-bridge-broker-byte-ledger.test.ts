@@ -64,7 +64,7 @@ function createFakeChannelHarness(): FakeChannelHarness {
   const forwards: PendingForward[] = [];
   const writtenDecoder = new DuplexFrameDecoder();
   let dataListener: ((chunk: string) => void) | null = null;
-  let exitListener: (() => void) | null = null;
+  let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
 
   const channel: CommandManagedDuplexChannel = {
     write: (data) => {
@@ -90,7 +90,7 @@ function createFakeChannelHarness(): FakeChannelHarness {
     },
     exit: () => {
       if (!exitListener) throw new Error("The broker did not bind the exit listener.");
-      exitListener();
+      exitListener({ exitCode: 0 });
     },
     responses,
     forwards,

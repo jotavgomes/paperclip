@@ -160,6 +160,7 @@ describe("DuplexAggregateByteLedger", () => {
       "request_payload",
       "response_body",
       "seen_request_id",
+      "decoder_buffer",
     ]);
   });
 });
