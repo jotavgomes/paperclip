@@ -118,6 +118,17 @@ describe("gemini_local ACP startup fallback", () => {
     );
   });
 
+  it("trusts the workspace for local (non-remote) headless execution too", async () => {
+    const ctx = buildContext();
+
+    await execute(ctx as never);
+
+    const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
+      | [string, unknown, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(call?.[4].env.GEMINI_CLI_TRUST_WORKSPACE).toBe("true");
+  });
+
   it("keeps explicit ACP strict when startup fails", async () => {
     const ctx = buildContext({ engine: "acp" });
 
