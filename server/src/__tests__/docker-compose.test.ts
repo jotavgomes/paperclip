@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 /**
  * Guards against the crash-loop incident: without a restart policy, `db`
  * stays Exited after a host reboot and `server` comes up before it,
- * crash-looping on ENOTFOUND "db". Also guards the migration/retention
- * flags a fresh onboarding run depends on being set explicitly rather than
- * left to whatever the image defaults to.
+ * crash-looping on ENOTFOUND "db". Also guards PAPERCLIP_MIGRATION_AUTO_APPLY
+ * (read in server/src/index.ts) staying set so a fresh onboarding run
+ * applies migrations automatically instead of refusing to start.
  */
 
 const COMPOSE_PATH = join(
@@ -31,9 +31,8 @@ describe("docker/docker-compose.yml", () => {
     expect(restartCount).toBe(2);
   });
 
-  it("enables migration auto-apply and disables retention dry-run on server", () => {
+  it("enables migration auto-apply on server", () => {
     const compose = readCompose();
     expect(compose).toMatch(/PAPERCLIP_MIGRATION_AUTO_APPLY:\s*"true"/);
-    expect(compose).toMatch(/PAPERCLIP_EXECUTION_WORKSPACE_RETENTION_DRY_RUN:\s*"false"/);
   });
 });

@@ -32,7 +32,6 @@ services:
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
       PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
-      PAPERCLIP_EXECUTION_WORKSPACE_RETENTION_DRY_RUN: "false"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
