@@ -4,30 +4,39 @@ import { POLL_JOB_KEY } from "./manifest.js";
 import { getUpdates, sendMessage, setMyCommands } from "./telegram-client.js";
 
 const OFFSET_STATE_KEY = "update-offset";
-const LINKS_STATE_KEY = "chat-company-links";
+const LINKS_STATE_KEY = "chat-links";
 const POLL_TIMEOUT_SEC = 25;
 
-interface ChatLink {
-  companyId: string;
-  companyName: string;
+/**
+ * The plugin's config is declared as `instanceConfigSchema`, but the host
+ * resolves it per company (each company that installs the plugin fills in
+ * its own bot token) — `ctx.config.get(companyId)` always needs an explicit
+ * companyId; there is no ambient "current company" during setup() or a job
+ * tick. So every entry point here iterates every company visible to the
+ * plugin and skips any that has no bot token configured yet.
+ */
+async function forEachConfiguredCompany(
+  ctx: PluginContext,
+  fn: (companyId: string, companyName: string, token: string) => Promise<void>,
+): Promise<void> {
+  const companies = await ctx.companies.list({ limit: 200 });
+  for (const company of companies) {
+    if (company.status !== "active") continue;
+    const config = await ctx.config.get(company.id);
+    const token = typeof config.botToken === "string" ? config.botToken.trim() : "";
+    if (!token) continue;
+    await fn(company.id, company.name, token);
+  }
 }
 
-type ChatLinks = Record<string, ChatLink>;
-
-async function readBotToken(ctx: PluginContext): Promise<string | null> {
-  const config = await ctx.config.get();
-  const token = typeof config.botToken === "string" ? config.botToken.trim() : "";
-  return token.length > 0 ? token : null;
-}
-
-async function readOffset(ctx: PluginContext): Promise<number> {
-  const stored = await ctx.state.get({ scopeKind: "instance", stateKey: OFFSET_STATE_KEY });
+async function readOffset(ctx: PluginContext, companyId: string): Promise<number> {
+  const stored = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: OFFSET_STATE_KEY });
   return typeof stored === "number" ? stored : 0;
 }
 
-async function readLinks(ctx: PluginContext): Promise<ChatLinks> {
-  const stored = await ctx.state.get({ scopeKind: "instance", stateKey: LINKS_STATE_KEY });
-  return stored && typeof stored === "object" ? (stored as ChatLinks) : {};
+async function readLinkedChatIds(ctx: PluginContext, companyId: string): Promise<number[]> {
+  const stored = await ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: LINKS_STATE_KEY });
+  return Array.isArray(stored) ? stored.filter((value): value is number => typeof value === "number") : [];
 }
 
 export function formatStatus(companyName: string, agentStatuses: string[]): string {
@@ -44,87 +53,118 @@ export function formatStatus(companyName: string, agentStatuses: string[]): stri
   return `${companyName}: ${agentStatuses.length} agent(s) — ${summary}.`;
 }
 
-async function handleConnect(ctx: PluginContext, chatId: number, companyQuery: string): Promise<string> {
-  const trimmed = companyQuery.trim();
+async function handleConnect(
+  ctx: PluginContext,
+  companyId: string,
+  companyName: string,
+  chatId: number,
+  nameQuery: string,
+): Promise<string> {
+  const trimmed = nameQuery.trim();
   if (!trimmed) {
     return "Usage: /connect <company name>";
   }
-  const companies = (await ctx.companies.list({ limit: 200 })).filter((company) => company.status === "active");
-  const lowerQuery = trimmed.toLowerCase();
-  const match =
-    companies.find((company) => company.name.toLowerCase() === lowerQuery) ??
-    companies.find((company) => company.name.toLowerCase().includes(lowerQuery));
-  if (!match) {
-    return `No company found matching "${trimmed}".`;
+  if (!companyName.toLowerCase().includes(trimmed.toLowerCase())) {
+    return `This bot is for "${companyName}", not "${trimmed}". Message the right company's bot instead.`;
   }
-  const links = await readLinks(ctx);
-  links[String(chatId)] = { companyId: match.id, companyName: match.name };
-  await ctx.state.set({ scopeKind: "instance", stateKey: LINKS_STATE_KEY }, links);
-  return `Connected this chat to "${match.name}". Try /status.`;
+  const linked = await readLinkedChatIds(ctx, companyId);
+  if (!linked.includes(chatId)) {
+    linked.push(chatId);
+    await ctx.state.set({ scopeKind: "company", scopeId: companyId, stateKey: LINKS_STATE_KEY }, linked);
+  }
+  return `Connected this chat to "${companyName}". Try /status.`;
 }
 
-async function handleStatus(ctx: PluginContext, chatId: number): Promise<string> {
-  const links = await readLinks(ctx);
-  const link = links[String(chatId)];
-  if (!link) {
-    return "This chat isn't connected to a company yet. Use /connect <company name> first.";
+async function handleStatus(ctx: PluginContext, companyId: string, companyName: string, chatId: number): Promise<string> {
+  const linked = await readLinkedChatIds(ctx, companyId);
+  if (!linked.includes(chatId)) {
+    return "This chat isn't connected yet. Use /connect <company name> first.";
   }
-  const agents = await ctx.agents.list({ companyId: link.companyId });
-  return formatStatus(link.companyName, agents.map((agent) => agent.status));
+  const agents = await ctx.agents.list({ companyId });
+  return formatStatus(companyName, agents.map((agent) => agent.status));
 }
 
-async function handleMessage(ctx: PluginContext, token: string, chatId: number, text: string): Promise<void> {
+async function handleMessage(
+  ctx: PluginContext,
+  companyId: string,
+  companyName: string,
+  token: string,
+  chatId: number,
+  text: string,
+): Promise<void> {
   const trimmed = text.trim();
   let reply: string;
   if (trimmed === "/status" || trimmed.startsWith("/status@")) {
-    reply = await handleStatus(ctx, chatId);
+    reply = await handleStatus(ctx, companyId, companyName, chatId);
   } else if (trimmed === "/connect" || trimmed.startsWith("/connect@") || trimmed.startsWith("/connect ")) {
     const afterCommand = trimmed.replace(/^\/connect(@\S+)?/, "");
-    reply = await handleConnect(ctx, chatId, afterCommand);
+    reply = await handleConnect(ctx, companyId, companyName, chatId, afterCommand);
   } else if (trimmed === "/start" || trimmed === "/help") {
-    reply =
-      "Commands:\n/connect <company name> — link this chat to a Paperclip company\n/status — show agent status for the connected company";
+    reply = `Commands:\n/connect ${companyName} — confirm this chat for ${companyName}\n/status — show agent status`;
   } else {
     return;
   }
   await sendMessage(ctx.http, token, chatId, reply);
 }
 
+const COMMANDS_REGISTERED_STATE_KEY = "commands-registered-for-token";
+
+/**
+ * Registers the bot's slash commands with Telegram once per distinct token
+ * (re-registering is cheap and idempotent, but there's no point calling it
+ * every minute). Tracked per company since each company's token is its own
+ * bot identity.
+ */
+async function ensureCommandsRegistered(
+  ctx: PluginContext,
+  companyId: string,
+  token: string,
+): Promise<void> {
+  const stateKey = { scopeKind: "company" as const, scopeId: companyId, stateKey: COMMANDS_REGISTERED_STATE_KEY };
+  const registeredForToken = await ctx.state.get(stateKey);
+  if (registeredForToken === token) return;
+  await setMyCommands(ctx.http, token, [
+    { command: "connect", description: "Confirm this chat for your company" },
+    { command: "status", description: "Show agent status" },
+  ]);
+  await ctx.state.set(stateKey, token);
+  ctx.logger.info("Bot commands registered with Telegram");
+}
+
 async function pollUpdates(ctx: PluginContext): Promise<void> {
-  const token = await readBotToken(ctx);
-  if (!token) {
-    ctx.logger.warn("telegram-bot-control: no bot token configured, skipping poll");
-    return;
-  }
-  const offset = await readOffset(ctx);
-  const updates = await getUpdates(ctx.http, token, offset, POLL_TIMEOUT_SEC);
-  let nextOffset = offset;
-  for (const update of updates) {
-    nextOffset = Math.max(nextOffset, update.update_id + 1);
-    const message = update.message;
-    if (!message?.text || typeof message.chat?.id !== "number") continue;
-    await handleMessage(ctx, token, message.chat.id, message.text);
-  }
-  if (nextOffset !== offset) {
-    await ctx.state.set({ scopeKind: "instance", stateKey: OFFSET_STATE_KEY }, nextOffset);
+  let sawAnyConfiguredCompany = false;
+  await forEachConfiguredCompany(ctx, async (companyId, companyName, token) => {
+    sawAnyConfiguredCompany = true;
+    await ensureCommandsRegistered(ctx, companyId, token);
+    const offset = await readOffset(ctx, companyId);
+    const updates = await getUpdates(ctx.http, token, offset, POLL_TIMEOUT_SEC);
+    let nextOffset = offset;
+    for (const update of updates) {
+      nextOffset = Math.max(nextOffset, update.update_id + 1);
+      const message = update.message;
+      if (!message?.text || typeof message.chat?.id !== "number") continue;
+      await handleMessage(ctx, companyId, companyName, token, message.chat.id, message.text);
+    }
+    if (nextOffset !== offset) {
+      await ctx.state.set({ scopeKind: "company", scopeId: companyId, stateKey: OFFSET_STATE_KEY }, nextOffset);
+    }
+  });
+  if (!sawAnyConfiguredCompany) {
+    ctx.logger.warn(
+      "telegram-bot-control: no company has a bot token configured yet — set one in plugin settings.",
+    );
   }
 }
 
 const plugin = definePlugin({
   async setup(ctx) {
+    // setup() runs once, globally, before any company context exists — it
+    // cannot call ctx.config.get() or anything else that requires a company
+    // binding (the host rejects it: "company context is required" regardless
+    // of an explicit companyId argument). All config-dependent work — command
+    // registration and update polling — happens inside the job handler below,
+    // whose invocations the host does bind to a company context.
     ctx.logger.info("Telegram bot plugin started");
-    const token = await readBotToken(ctx);
-    if (token) {
-      await setMyCommands(ctx.http, token, [
-        { command: "connect", description: "Link this chat to a Paperclip company" },
-        { command: "status", description: "Show agent status for the connected company" },
-      ]);
-      ctx.logger.info("Bot commands registered with Telegram");
-    } else {
-      ctx.logger.warn(
-        "telegram-bot-control: no bot token configured yet — set it in plugin settings, then re-enable the plugin.",
-      );
-    }
     ctx.jobs.register(POLL_JOB_KEY, () => pollUpdates(ctx));
   },
 

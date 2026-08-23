@@ -41,7 +41,9 @@ function makeCompany(overrides: Partial<Company> & { id: string; name: string })
   } as Company;
 }
 
-function makeAgent(overrides: Partial<Agent> & { id: string; companyId: string; name: string; status: Agent["status"] }): Agent {
+function makeAgent(
+  overrides: Partial<Agent> & { id: string; companyId: string; name: string; status: Agent["status"] },
+): Agent {
   const now = new Date();
   return {
     urlKey: overrides.name.toLowerCase().replace(/\s+/g, "-"),
@@ -95,33 +97,63 @@ describe("telegram bot control plugin", () => {
     expect(manifest.jobs?.[0]?.jobKey).toBe(POLL_JOB_KEY);
   });
 
-  it("registers commands with Telegram on setup when a bot token is configured", async () => {
-    fetchMock.mockResolvedValueOnce(telegramResponse(true));
+  it("logs startup without touching config (setup has no company context)", async () => {
     const harness = createTestHarness({ manifest });
-    harness.setConfig({ botToken: BOT_TOKEN });
-
-    await plugin.definition.setup(harness.ctx);
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`);
-    expect(JSON.parse(init.body as string).commands).toEqual([
-      { command: "connect", description: "Link this chat to a Paperclip company" },
-      { command: "status", description: "Show agent status for the connected company" },
-    ]);
-    expect(harness.logs.some((entry) => entry.message === "Telegram bot plugin started")).toBe(true);
-    expect(harness.logs.some((entry) => entry.message === "Bot commands registered with Telegram")).toBe(true);
-  });
-
-  it("skips Telegram setup when no bot token is configured", async () => {
-    const harness = createTestHarness({ manifest });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
 
     await plugin.definition.setup(harness.ctx);
 
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(harness.logs.some((entry) => entry.message === "Telegram bot plugin started")).toBe(true);
   });
 
-  it("links a chat to a company on /connect and reports its agents on /status", async () => {
+  it("registers commands with Telegram on the first poll for a company with a bot token configured", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+    fetchMock
+      .mockResolvedValueOnce(telegramResponse(true)) // setMyCommands
+      .mockResolvedValueOnce(telegramResponse([])); // getUpdates
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`);
+    expect(JSON.parse(init.body as string).commands).toEqual([
+      { command: "connect", description: "Confirm this chat for your company" },
+      { command: "status", description: "Show agent status" },
+    ]);
+    expect(harness.logs.some((entry) => entry.message === "Bot commands registered with Telegram")).toBe(true);
+  });
+
+  it("does not re-register commands on a second poll for the same token", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    fetchMock.mockResolvedValueOnce(telegramResponse([]));
+    await harness.runJob(POLL_JOB_KEY);
+
+    const setMyCommandsCalls = fetchMock.mock.calls.filter(([url]) => (url as string).includes("setMyCommands"));
+    expect(setMyCommandsCalls).toHaveLength(1);
+  });
+
+  it("skips polling when no company has a bot token configured", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("confirms the chat on /connect <company name> and reports agents on /status", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({
@@ -159,9 +191,30 @@ describe("telegram bot control plugin", () => {
     expect(statusBody.text).toBe("Acme Robotics: 2 agent(s) — 1 idle, 1 active.");
   });
 
+  it("rejects /connect with a name that doesn't match this bot's company", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock
+      .mockResolvedValueOnce(telegramResponse(true))
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: "/connect wrong-company" } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}));
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    const replyCall = fetchMock.mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(replyCall[1].body as string);
+    expect(body.text).toContain("not");
+  });
+
   it("tells an unconnected chat to /connect first", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
 
     fetchMock
       .mockResolvedValueOnce(telegramResponse(true))
@@ -179,6 +232,7 @@ describe("telegram bot control plugin", () => {
   it("does not reply to unrelated messages", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
 
     fetchMock
       .mockResolvedValueOnce(telegramResponse(true))
@@ -188,5 +242,16 @@ describe("telegram bot control plugin", () => {
     await harness.runJob(POLL_JOB_KEY);
 
     expect(fetchMock).toHaveBeenCalledTimes(2); // setMyCommands + getUpdates only, no sendMessage
+  });
+
+  it("skips archived companies even if a bot token is configured", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Old Co", status: "archived" })] });
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
