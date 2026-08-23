@@ -1050,6 +1050,28 @@ async function prepareCodexSkillRuntime(input: {
       targetHome: managedCodexHome,
       onLog: input.onLog,
     });
+  // Mirrors codex-local/server/execute.ts's writeApiKeyAuthJson for the CLI
+  // lane. That lane writes auth.json from a configured OPENAI_API_KEY; this
+  // ACP lane's prepareManagedCodexHome only inherits an existing auth.json
+  // from sourceHome and is skipped entirely once CODEX_HOME is configured
+  // (the default for every codex_local agent), so a per-agent OPENAI_API_KEY
+  // — plain or secret-bound — was never written anywhere the codex-acp server
+  // reads from, and every run failed with "Authentication required" even
+  // with a valid key configured.
+  const configuredApiKey =
+    typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
+      ? envConfig.OPENAI_API_KEY.trim()
+      : null;
+  if (configuredApiKey) {
+    const authPath = path.join(effectiveCodexHome, "auth.json");
+    await fs.mkdir(effectiveCodexHome, { recursive: true });
+    await fs.rm(authPath, { force: true });
+    await fs.writeFile(authPath, JSON.stringify({ OPENAI_API_KEY: configuredApiKey }), { mode: 0o600 });
+    await input.onLog(
+      "stdout",
+      `[paperclip] Wrote API-key auth.json into ACPX Codex home "${effectiveCodexHome}" from configured OPENAI_API_KEY.\n`,
+    );
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");

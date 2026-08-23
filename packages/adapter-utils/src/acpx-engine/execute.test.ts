@@ -1182,6 +1182,51 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(await pathExists(path.join(codexHome, "skills", remove.runtimeName))).toBe(false);
   });
 
+  it.skipIf(process.platform === "win32")(
+    "writes auth.json from a configured OPENAI_API_KEY into an already-configured Codex home",
+    async () => {
+      // Regression test: CODEX_HOME is set explicitly here, which is the
+      // default for every codex_local agent (the server pre-populates it on
+      // agent creation). Before the fix, prepareManagedCodexHome was skipped
+      // entirely whenever CODEX_HOME was already configured, so a per-agent
+      // OPENAI_API_KEY (plain or secret-resolved to a plain string by the
+      // time it reaches this engine) was never written anywhere the
+      // codex-acp server reads credentials from, and every run failed with
+      // "Authentication required" even with a valid key configured.
+      const root = await makeTempRoot();
+      const codexHome = path.join(root, "codex-home");
+
+      await runExecutor({
+        agent: "codex",
+        stateDir: path.join(root, "state"),
+        env: { CODEX_HOME: codexHome, OPENAI_API_KEY: "sk-test-configured-key" },
+        paperclipRuntimeSkills: [],
+        paperclipSkillSync: { desiredSkills: [] },
+      });
+
+      const authJson = JSON.parse(await fs.readFile(path.join(codexHome, "auth.json"), "utf8"));
+      expect(authJson).toEqual({ OPENAI_API_KEY: "sk-test-configured-key" });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not write auth.json when no OPENAI_API_KEY is configured",
+    async () => {
+      const root = await makeTempRoot();
+      const codexHome = path.join(root, "codex-home");
+
+      await runExecutor({
+        agent: "codex",
+        stateDir: path.join(root, "state"),
+        env: { CODEX_HOME: codexHome },
+        paperclipRuntimeSkills: [],
+        paperclipSkillSync: { desiredSkills: [] },
+      });
+
+      expect(await pathExists(path.join(codexHome, "auth.json"))).toBe(false);
+    },
+  );
+
   it.skipIf(process.platform === "win32")("removes legacy ACPX Codex skill symlinks when a skill is no longer desired", async () => {
     const root = await makeTempRoot();
     const skillRoot = path.join(root, "skills");
