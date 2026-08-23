@@ -1182,50 +1182,93 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(await pathExists(path.join(codexHome, "skills", remove.runtimeName))).toBe(false);
   });
 
-  it.skipIf(process.platform === "win32")(
-    "writes auth.json from a configured OPENAI_API_KEY into an already-configured Codex home",
-    async () => {
-      // Regression test: CODEX_HOME is set explicitly here, which is the
-      // default for every codex_local agent (the server pre-populates it on
-      // agent creation). Before the fix, prepareManagedCodexHome was skipped
-      // entirely whenever CODEX_HOME was already configured, so a per-agent
-      // OPENAI_API_KEY (plain or secret-resolved to a plain string by the
-      // time it reaches this engine) was never written anywhere the
-      // codex-acp server reads credentials from, and every run failed with
-      // "Authentication required" even with a valid key configured.
-      const root = await makeTempRoot();
-      const codexHome = path.join(root, "codex-home");
+  describe("Codex ACP API-key auth.json seeding", () => {
+    let root: string;
+    let managedCodexHome: string;
+    let previousPaperclipHome: string | undefined;
+    let previousPaperclipInstanceId: string | undefined;
 
-      await runExecutor({
-        agent: "codex",
-        stateDir: path.join(root, "state"),
-        env: { CODEX_HOME: codexHome, OPENAI_API_KEY: "sk-test-configured-key" },
-        paperclipRuntimeSkills: [],
-        paperclipSkillSync: { desiredSkills: [] },
-      });
+    beforeEach(async () => {
+      root = await makeTempRoot();
+      const paperclipHome = path.join(root, "paperclip-home");
+      managedCodexHome = path.join(paperclipHome, "instances", "test-instance", "companies", "company-1", "codex-home");
+      previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    });
 
-      const authJson = JSON.parse(await fs.readFile(path.join(codexHome, "auth.json"), "utf8"));
-      expect(authJson).toEqual({ OPENAI_API_KEY: "sk-test-configured-key" });
-    },
-  );
+    afterEach(() => {
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+    });
 
-  it.skipIf(process.platform === "win32")(
-    "does not write auth.json when no OPENAI_API_KEY is configured",
-    async () => {
-      const root = await makeTempRoot();
-      const codexHome = path.join(root, "codex-home");
+    it.skipIf(process.platform === "win32")(
+      "writes auth.json from a configured OPENAI_API_KEY into an already-configured managed Codex home",
+      async () => {
+        // Regression test: CODEX_HOME is set explicitly here, which is the
+        // default for every codex_local agent (the server pre-populates it
+        // with a path under the managed company tree on agent creation).
+        // Before the fix, prepareManagedCodexHome was skipped entirely
+        // whenever CODEX_HOME was already configured, so a per-agent
+        // OPENAI_API_KEY (plain or secret-resolved to a plain string by the
+        // time it reaches this engine) was never written anywhere the
+        // codex-acp server reads credentials from, and every run failed
+        // with "Authentication required" even with a valid key configured.
+        await runExecutor({
+          agent: "codex",
+          stateDir: path.join(root, "state"),
+          env: { CODEX_HOME: managedCodexHome, OPENAI_API_KEY: "sk-test-configured-key" },
+          paperclipRuntimeSkills: [],
+          paperclipSkillSync: { desiredSkills: [] },
+        });
 
-      await runExecutor({
-        agent: "codex",
-        stateDir: path.join(root, "state"),
-        env: { CODEX_HOME: codexHome },
-        paperclipRuntimeSkills: [],
-        paperclipSkillSync: { desiredSkills: [] },
-      });
+        const authJson = JSON.parse(await fs.readFile(path.join(managedCodexHome, "auth.json"), "utf8"));
+        expect(authJson).toEqual({ OPENAI_API_KEY: "sk-test-configured-key" });
+      },
+    );
 
-      expect(await pathExists(path.join(codexHome, "auth.json"))).toBe(false);
-    },
-  );
+    it.skipIf(process.platform === "win32")(
+      "does not write auth.json when no OPENAI_API_KEY is configured",
+      async () => {
+        await runExecutor({
+          agent: "codex",
+          stateDir: path.join(root, "state"),
+          env: { CODEX_HOME: managedCodexHome },
+          paperclipRuntimeSkills: [],
+          paperclipSkillSync: { desiredSkills: [] },
+        });
+
+        expect(await pathExists(path.join(managedCodexHome, "auth.json"))).toBe(false);
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "leaves an explicit external CODEX_HOME's existing auth.json untouched",
+      async () => {
+        // An OPENAI_API_KEY configured alongside a CODEX_HOME pointed outside
+        // the Paperclip-managed tree must never overwrite that home's own
+        // credentials — it's the user's own external Codex login (native or
+        // subscription auth), which the CLI lane also leaves alone.
+        const externalCodexHome = path.join(root, "external-codex-home");
+        await fs.mkdir(externalCodexHome, { recursive: true });
+        await fs.writeFile(path.join(externalCodexHome, "auth.json"), JSON.stringify({ external: true }), "utf8");
+
+        await runExecutor({
+          agent: "codex",
+          stateDir: path.join(root, "state"),
+          env: { CODEX_HOME: externalCodexHome, OPENAI_API_KEY: "sk-test-should-not-be-written" },
+          paperclipRuntimeSkills: [],
+          paperclipSkillSync: { desiredSkills: [] },
+        });
+
+        const authJson = JSON.parse(await fs.readFile(path.join(externalCodexHome, "auth.json"), "utf8"));
+        expect(authJson).toEqual({ external: true });
+      },
+    );
+  });
 
   it.skipIf(process.platform === "win32")("removes legacy ACPX Codex skill symlinks when a skill is no longer desired", async () => {
     const root = await makeTempRoot();

@@ -611,6 +611,19 @@ function resolveManagedCodexHomeDir(companyId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "codex-home");
 }
 
+// Mirrors codex-local/server/codex-home.ts's isManagedCodexHomePath. A managed
+// home is any path under the company's instance root — not just the bare
+// company-level codex-home dir resolveManagedCodexHomeDir returns, since
+// codex_local agents are actually assigned a per-agent home nested under it
+// (companies/<id>/agents/<agentId>/codex-home). An explicit, user-supplied
+// CODEX_HOME outside that tree is left alone: the CLI lane never touches auth
+// there, and the ACP lane must not either.
+function isManagedCodexHomePath(companyId: string, homePath: string): boolean {
+  const companyRoot = path.join(defaultPaperclipInstanceDir(), "companies", companyId);
+  const resolved = path.resolve(homePath);
+  return resolved === companyRoot || resolved.startsWith(companyRoot + path.sep);
+}
+
 // Walk up from startDir looking for `node_modules/.bin/<binName>`. This matches
 // npm/pnpm binary hoisting in packaged installs while preserving monorepo dev.
 export async function findAncestorBin(startDir: string, binName: string): Promise<string | null> {
@@ -1062,7 +1075,13 @@ async function prepareCodexSkillRuntime(input: {
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
       : null;
-  if (configuredApiKey) {
+  // Only ever write into a Paperclip-managed home. An explicitly configured
+  // CODEX_HOME outside the managed tree is a user's own external Codex home
+  // (their own login, their own auth.json) — the CLI lane deliberately leaves
+  // it untouched, and overwriting it here would destroy that credential the
+  // moment an unrelated OPENAI_API_KEY happened to also be set.
+  const canWriteAuthJson = configuredCodexHome == null || isManagedCodexHomePath(input.companyId, configuredCodexHome);
+  if (configuredApiKey && canWriteAuthJson) {
     const authPath = path.join(effectiveCodexHome, "auth.json");
     await fs.mkdir(effectiveCodexHome, { recursive: true });
     await fs.rm(authPath, { force: true });
