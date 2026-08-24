@@ -13,6 +13,14 @@ function telegramResponse(result: unknown) {
   });
 }
 
+async function readConnectCode(harness: ReturnType<typeof createTestHarness>, companyId: string): Promise<string> {
+  const stored = await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, stateKey: "connect-code" });
+  if (typeof stored !== "object" || stored === null || typeof (stored as { code?: unknown }).code !== "string") {
+    throw new Error(`No connect code stored for company ${companyId}`);
+  }
+  return (stored as { code: string }).code;
+}
+
 function makeCompany(overrides: Partial<Company> & { id: string; name: string }): Company {
   const now = new Date();
   return {
@@ -153,7 +161,7 @@ describe("telegram bot control plugin", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("confirms the chat on /connect <company name> and reports agents on /status", async () => {
+  it("confirms the chat on /connect <company name> <code> and reports agents on /status", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({
@@ -164,17 +172,21 @@ describe("telegram bot control plugin", () => {
       ],
     });
 
-    fetchMock
-      .mockResolvedValueOnce(telegramResponse(true)) // setMyCommands during setup
-      .mockResolvedValueOnce(
-        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: "/connect acme" } }]),
-      ) // getUpdates
-      .mockResolvedValueOnce(telegramResponse({})); // sendMessage (connect reply)
-
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
     await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY); // generates the connect code, no incoming messages yet
+
+    const code = await readConnectCode(harness, "company-1");
+    expect(harness.logs.some((entry) => entry.message.includes(`Telegram connect code for "Acme Robotics": ${code}`))).toBe(true);
+
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: `/connect acme ${code}` } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({})); // sendMessage (connect reply)
     await harness.runJob(POLL_JOB_KEY);
 
-    const connectCall = fetchMock.mock.calls[2] as [string, RequestInit];
+    const connectCall = fetchMock.mock.calls[3] as [string, RequestInit];
     expect(connectCall[0]).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`);
     const connectBody = JSON.parse(connectCall[1].body as string);
     expect(connectBody.chat_id).toBe(42);
@@ -186,32 +198,112 @@ describe("telegram bot control plugin", () => {
 
     await harness.runJob(POLL_JOB_KEY);
 
-    const statusCall = fetchMock.mock.calls[4] as [string, RequestInit];
+    const statusCall = fetchMock.mock.calls[5] as [string, RequestInit];
     const statusBody = JSON.parse(statusCall[1].body as string);
     expect(statusBody.text).toBe("Acme Robotics: 2 agent(s) — 1 idle, 1 active.");
   });
 
-  it("rejects /connect with a name that doesn't match this bot's company", async () => {
+  it("rejects /connect with a name that doesn't match this bot's company, without consuming the code", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
 
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+    const code = await readConnectCode(harness, "company-1");
+
     fetchMock
-      .mockResolvedValueOnce(telegramResponse(true))
       .mockResolvedValueOnce(
-        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: "/connect wrong-company" } }]),
+        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: `/connect wrong-company ${code}` } }]),
       )
       .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
 
+    const replyCall = fetchMock.mock.calls[3] as [string, RequestInit];
+    const body = JSON.parse(replyCall[1].body as string);
+    expect(body.text).toContain("not");
+    // A rejection on the name check shouldn't burn the code — it's still usable against the right name.
+    expect(await readConnectCode(harness, "company-1")).toBe(code);
+  });
+
+  it("rejects /connect with the right company name but a missing or wrong code", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
     await plugin.definition.setup(harness.ctx);
     await harness.runJob(POLL_JOB_KEY);
 
-    const replyCall = fetchMock.mock.calls[2] as [string, RequestInit];
-    const body = JSON.parse(replyCall[1].body as string);
-    expect(body.text).toContain("not");
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([
+          { update_id: 1, message: { chat: { id: 42 }, text: "/connect acme WRONGCODE" } },
+          { update_id: 2, message: { chat: { id: 43 }, text: "/connect acme" } }, // no code token at all
+        ]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}))
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+
+    const wrongCodeReply = JSON.parse((fetchMock.mock.calls[3] as [string, RequestInit])[1].body as string);
+    expect(wrongCodeReply.text).toContain("Invalid or expired confirmation code");
+    const missingCodeReply = JSON.parse((fetchMock.mock.calls[4] as [string, RequestInit])[1].body as string);
+    expect(missingCodeReply.text).toContain("Usage: /connect");
+
+    // Neither attempt should have linked its chat.
+    fetchMock.mockResolvedValueOnce(
+      telegramResponse([{ update_id: 3, message: { chat: { id: 42 }, text: "/status" } }]),
+    ).mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+    const statusReply = JSON.parse((fetchMock.mock.calls[6] as [string, RequestInit])[1].body as string);
+    expect(statusReply.text).toContain("/connect");
   });
 
-  it("tells an unconnected chat to /connect first", async () => {
+  it("a connect code is single-use: a second /connect with the same code fails", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+    const firstCode = await readConnectCode(harness, "company-1");
+
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: `/connect acme ${firstCode}` } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+
+    // A fresh code should already be in place for the next chat to connect.
+    const secondCode = await readConnectCode(harness, "company-1");
+    expect(secondCode).not.toBe(firstCode);
+
+    // A different chat trying the OLD (already-spent) code must be rejected.
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 2, message: { chat: { id: 99 }, text: `/connect acme ${firstCode}` } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+    const replayReply = JSON.parse((fetchMock.mock.calls[5] as [string, RequestInit])[1].body as string);
+    expect(replayReply.text).toContain("Invalid or expired confirmation code");
+
+    // The still-unused fresh code works for the new chat.
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 3, message: { chat: { id: 99 }, text: `/connect acme ${secondCode}` } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+    const secondConnectReply = JSON.parse((fetchMock.mock.calls[7] as [string, RequestInit])[1].body as string);
+    expect(secondConnectReply.text).toContain("Connected");
+  });
+
+  it("tells an unconnected chat to /connect (with a code) first", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
