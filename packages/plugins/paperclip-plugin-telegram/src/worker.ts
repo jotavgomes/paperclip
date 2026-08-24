@@ -193,6 +193,65 @@ async function handleStatus(ctx: PluginContext, companyId: string, companyName: 
   return formatStatus(companyName, agents.map((agent) => agent.status));
 }
 
+/**
+ * Picks the target agent for /task. An explicit "@name" prefix matches by
+ * case-insensitive substring against active agent names (first match wins,
+ * same convention as /connect's company-name match). With no prefix, default
+ * to the agent with role "cto" — the company's lead agent — since that's the
+ * natural target for "just get this done" requests sent from a phone.
+ */
+function resolveTaskTarget(
+  agents: Array<{ id: string; name: string; role: string; status: string }>,
+  rawText: string,
+): { agent: { id: string; name: string } | null; taskText: string; mentionedButNotFound: string | null } {
+  const active = agents.filter((agent) => agent.status !== "terminated");
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith("@")) {
+    const spaceIndex = trimmed.search(/\s/);
+    const mention = (spaceIndex === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIndex)).trim();
+    const taskText = (spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1)).trim();
+    const match = active.find((agent) => agent.name.toLowerCase().includes(mention.toLowerCase()));
+    if (!match) return { agent: null, taskText, mentionedButNotFound: mention };
+    return { agent: match, taskText, mentionedButNotFound: null };
+  }
+  const cto = active.find((agent) => agent.role.toLowerCase() === "cto");
+  return { agent: cto ?? null, taskText: trimmed, mentionedButNotFound: null };
+}
+
+async function handleTask(
+  ctx: PluginContext,
+  companyId: string,
+  companyName: string,
+  chatId: number,
+  rawText: string,
+): Promise<string> {
+  const linked = await readLinkedChatIds(ctx, companyId);
+  if (!linked.includes(chatId)) {
+    return "This chat isn't connected yet. Use /connect <company name> first.";
+  }
+  const agents = await ctx.agents.list({ companyId });
+  const { agent, taskText, mentionedButNotFound } = resolveTaskTarget(agents, rawText);
+  if (mentionedButNotFound) {
+    return `No agent matching "@${mentionedButNotFound}" found in ${companyName}. Try /status to see agent names.`;
+  }
+  if (!agent) {
+    return "No CTO agent found to default to. Use /task @agent-name <description> to target a specific agent.";
+  }
+  if (!taskText) {
+    return "Usage: /task <description>  or  /task @agent-name <description>";
+  }
+  const title = taskText.length > 120 ? `${taskText.slice(0, 117)}...` : taskText;
+  const description = taskText.length > 120 ? taskText : undefined;
+  const issue = await ctx.issues.create({
+    companyId,
+    title,
+    description,
+    assigneeAgentId: agent.id,
+  });
+  await ctx.issues.requestWakeup(issue.id, companyId, { reason: "telegram /task command" });
+  return `Created ${issue.identifier ?? issue.id} for ${agent.name}: "${title}"`;
+}
+
 async function handleMessage(
   ctx: PluginContext,
   companyId: string,
@@ -208,11 +267,16 @@ async function handleMessage(
   } else if (trimmed === "/connect" || trimmed.startsWith("/connect@") || trimmed.startsWith("/connect ")) {
     const afterCommand = trimmed.replace(/^\/connect(@\S+)?/, "");
     reply = await handleConnect(ctx, companyId, companyName, chatId, afterCommand);
+  } else if (trimmed === "/task" || trimmed.startsWith("/task@") || trimmed.startsWith("/task ")) {
+    const afterCommand = trimmed.replace(/^\/task(@\S+)?/, "");
+    reply = await handleTask(ctx, companyId, companyName, chatId, afterCommand);
   } else if (trimmed === "/start" || trimmed === "/help") {
     reply =
       `Commands:\n` +
       `/connect ${companyName} <code> — confirm this chat for ${companyName} (ask an admin for the code)\n` +
-      `/status — show agent status`;
+      `/status — show agent status\n` +
+      `/task <description> — assign a task to the CTO\n` +
+      `/task @agent-name <description> — assign a task to a specific agent`;
   } else {
     return;
   }
@@ -221,11 +285,19 @@ async function handleMessage(
 
 const COMMANDS_REGISTERED_STATE_KEY = "commands-registered-for-token";
 
+const BOT_COMMANDS = [
+  { command: "connect", description: "Confirm this chat for your company" },
+  { command: "status", description: "Show agent status" },
+  { command: "task", description: "Assign a task to an agent" },
+];
+
 /**
- * Registers the bot's slash commands with Telegram once per distinct token
- * (re-registering is cheap and idempotent, but there's no point calling it
- * every minute). Tracked per company since each company's token is its own
- * bot identity.
+ * Registers the bot's slash commands with Telegram once per distinct
+ * (token, command set) pair — re-registering is cheap and idempotent, but
+ * there's no point calling it every minute. Keying on the command set too
+ * (not just the token) means a plugin upgrade that adds/changes a command
+ * re-registers it with Telegram even though the token hasn't changed.
+ * Tracked per company since each company's token is its own bot identity.
  */
 async function ensureCommandsRegistered(
   ctx: PluginContext,
@@ -233,13 +305,11 @@ async function ensureCommandsRegistered(
   token: string,
 ): Promise<void> {
   const stateKey = { scopeKind: "company" as const, scopeId: companyId, stateKey: COMMANDS_REGISTERED_STATE_KEY };
-  const registeredForToken = await ctx.state.get(stateKey);
-  if (registeredForToken === token) return;
-  await setMyCommands(ctx.http, token, [
-    { command: "connect", description: "Confirm this chat for your company" },
-    { command: "status", description: "Show agent status" },
-  ]);
-  await ctx.state.set(stateKey, token);
+  const fingerprint = `${token}::${JSON.stringify(BOT_COMMANDS)}`;
+  const registeredFor = await ctx.state.get(stateKey);
+  if (registeredFor === fingerprint) return;
+  await setMyCommands(ctx.http, token, BOT_COMMANDS);
+  await ctx.state.set(stateKey, fingerprint);
   ctx.logger.info("Bot commands registered with Telegram");
 }
 

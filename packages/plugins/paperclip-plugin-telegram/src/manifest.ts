@@ -9,17 +9,19 @@ export const POLL_JOB_KEY = "poll-updates";
 
 /**
  * Minimal Telegram bot control plugin: /connect links a chat to a Paperclip
- * company, /status reports that company's agent counts by status. Polls
- * Telegram's getUpdates on a one-minute schedule rather than holding a
- * persistent long-poll connection open, since plugin jobs are host-scheduled
- * rather than long-running processes.
+ * company, /status reports that company's agent counts by status, /task
+ * creates a new task and assigns it to an agent (the CTO by default, or a
+ * named agent via /task @agent-name ...). Polls Telegram's getUpdates on a
+ * one-minute schedule rather than holding a persistent long-poll connection
+ * open, since plugin jobs are host-scheduled rather than long-running
+ * processes.
  */
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
   apiVersion: 1,
   version: PLUGIN_VERSION,
   displayName: "Telegram Bot Control",
-  description: "Check on your Paperclip company from Telegram: /connect <company name> links a chat, /status reports agent counts.",
+  description: "Check on your Paperclip company from Telegram: /connect <company name> links a chat, /status reports agent counts, /task assigns work to an agent.",
   author: "Paperclip",
   categories: ["automation", "connector"],
   capabilities: [
@@ -29,6 +31,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "plugin.state.read",
     "plugin.state.write",
     "jobs.schedule",
+    "issues.read",
+    "issues.create",
+    "issues.wakeup",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
