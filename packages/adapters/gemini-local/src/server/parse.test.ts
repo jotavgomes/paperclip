@@ -157,6 +157,12 @@ describe("isGeminiSessionUnrecoverableError", () => {
     expect(isGeminiSessionUnrecoverableError("", "Resumed session abc-123 not found on disk")).toBe(true);
   });
 
+  it("matches the Gemini CLI's actual 'no previous sessions found for this project' error", () => {
+    expect(
+      isGeminiSessionUnrecoverableError("", "Error resuming session: No previous sessions found for this project."),
+    ).toBe(true);
+  });
+
   it("matches 'exceeds the maximum number of tokens' (compression overflow)", () => {
     const stderr =
       '_ApiError: {"error":{"code":400,"message":"The input token count exceeds the maximum number of tokens allowed 1048576","status":"INVALID_ARGUMENT"}} at ChatCompressionService.compress';

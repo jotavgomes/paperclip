@@ -310,7 +310,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
-  if (executionTargetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
+  // Paperclip's headless runner never has an interactive TTY to answer the
+  // Gemini CLI's "trust this folder?" prompt, for local execution just as
+  // much as remote — the workspace is either a fresh fallback dir (no
+  // persistent project) or effectively new to the CLI's per-project trust
+  // store on every run. Without this, every local invocation without an
+  // already-trusted folder hard-fails headlessly.
+  if (typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
   if (authToken) {
@@ -517,9 +523,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const notes: string[] = ["Prompt is passed to Gemini via --prompt for non-interactive execution."];
     notes.push("Added --approval-mode yolo for unattended execution.");
     notes.push("Set headless terminal/browser env so Gemini fails fast instead of opening interactive auth or color prompts.");
-    if (executionTargetIsRemote) {
-      notes.push("Set GEMINI_CLI_TRUST_WORKSPACE=true for remote headless execution.");
-    }
+    notes.push("Set GEMINI_CLI_TRUST_WORKSPACE=true for headless execution.");
     if (!instructionsFilePath) return notes;
     if (instructionsPrefix.length > 0) {
       notes.push(
