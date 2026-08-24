@@ -170,6 +170,22 @@ describe("FileViewerSheet copy actions", () => {
     expect(previewPane?.className).not.toContain("rounded");
   });
 
+  it("degrades to no-preview instead of throwing when capabilities is missing from the resolved resource", () => {
+    const resourceWithoutCapabilities = { ...resolvedResource } as Partial<ResolvedWorkspaceResource>;
+    delete resourceWithoutCapabilities.capabilities;
+
+    useQueryMock.mockImplementation((options: { queryKey?: readonly unknown[] }) => {
+      const key = JSON.stringify(options.queryKey ?? []);
+      if (key.includes('"content"')) return ok(content);
+      return ok(resourceWithoutCapabilities);
+    });
+
+    expect(() => renderSheet()).not.toThrow();
+
+    expect(document.body.querySelector('a[aria-label="Download file"]')).toBeNull();
+    expect(document.body.textContent).toContain("Can't preview this file");
+  });
+
   it("defaults Markdown files to rendered mode and switches back to raw source", async () => {
     useQueryMock.mockImplementation((options: { queryKey?: readonly unknown[] }) => {
       const key = JSON.stringify(options.queryKey ?? []);

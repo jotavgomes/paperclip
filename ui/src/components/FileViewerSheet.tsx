@@ -512,8 +512,8 @@ export function FileViewerSheet({
   });
 
   const resolvedResource: ResolvedWorkspaceResource | undefined = resolveQuery.data;
-  const canPreview = resolvedResource?.capabilities.preview ?? false;
-  const downloadUrl = state && resolvedResource?.capabilities.download
+  const canPreview = resolvedResource?.capabilities?.preview ?? false;
+  const downloadUrl = state && resolvedResource?.capabilities?.download
     ? fileResourcesApi.downloadUrl(issueId, state)
     : null;
 
