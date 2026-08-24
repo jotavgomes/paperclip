@@ -1912,6 +1912,80 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     );
   });
 
+  it("keeps the previously materialized __runtime__ directory intact when a re-materialization fails", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/atomic-materialize`;
+    const missingSkillDir = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-atomic-materialize-")),
+      "gone",
+    );
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "atomic-materialize",
+      name: "Atomic Materialize",
+      description: null,
+      markdown: "# Atomic Materialize\n\nGood version.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {
+        paperclipSkillSync: {
+          desiredSkills: [skillKey],
+        },
+      },
+    });
+
+    const firstEntries = await svc.listRuntimeSkillEntries(companyId);
+    const firstEntry = firstEntries.find((candidate) => candidate.key === skillKey);
+    expect(firstEntry).toMatchObject({ key: skillKey, sourceStatus: "available" });
+    const materializedDir = firstEntry!.source;
+    await expect(fs.readFile(path.join(materializedDir, "SKILL.md"), "utf8")).resolves.toBe(
+      "# Atomic Materialize\n\nGood version.\n",
+    );
+
+    // Break the skill so the next materialization attempt fails before writing
+    // SKILL.md: no stored markdown to fall back to, and an inventory that
+    // does not include SKILL.md, so materializeRuntimeSkillFiles throws
+    // instead of committing the staging directory.
+    await db
+      .update(companySkills)
+      .set({ markdown: "", fileInventory: [{ path: "notes.txt", kind: "doc" }] })
+      .where(eq(companySkills.id, skillId));
+
+    const secondEntries = await svc.listRuntimeSkillEntries(companyId);
+    expect(secondEntries.find((candidate) => candidate.key === skillKey)).toBeUndefined();
+
+    // The old, good materialization must still be there — the fix routes
+    // the write through a staging directory that only replaces the live
+    // one on success, instead of the previous rm-then-rebuild sequence
+    // that deleted the live directory unconditionally up front.
+    await expect(fs.readFile(path.join(materializedDir, "SKILL.md"), "utf8")).resolves.toBe(
+      "# Atomic Materialize\n\nGood version.\n",
+    );
+  });
+
   it("falls back to stored markdown when reading SKILL.md from a missing local source", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
