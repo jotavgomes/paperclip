@@ -5635,28 +5635,24 @@ export function companySkillService(db: Db) {
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
-    const replacement = await createDirectoryReplacement(skillDir);
-    try {
-      let wroteSkillFile = false;
-      for (const entry of skill.fileInventory) {
-        const normalizedPath = normalizePortablePath(entry.path);
-        const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
-        const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
-        if (content === null) continue;
-        const targetPath = path.resolve(replacement.stagingDir, entry.path);
-        await fs.mkdir(path.dirname(targetPath), { recursive: true });
-        await fs.writeFile(targetPath, content, "utf8");
-        if (normalizedPath === "SKILL.md") wroteSkillFile = true;
-      }
+    await fs.rm(skillDir, { recursive: true, force: true });
+    await fs.mkdir(skillDir, { recursive: true });
 
-      if (!wroteSkillFile) {
-        throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
-      }
+    let wroteSkillFile = false;
+    for (const entry of skill.fileInventory) {
+      const normalizedPath = normalizePortablePath(entry.path);
+      const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
+      const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
+      if (content === null) continue;
+      const targetPath = path.resolve(skillDir, entry.path);
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, content, "utf8");
+      if (normalizedPath === "SKILL.md") wroteSkillFile = true;
+    }
 
-      await replacement.commit();
-    } catch (error) {
-      await replacement.cleanup();
-      throw error;
+    if (!wroteSkillFile) {
+      await fs.rm(skillDir, { recursive: true, force: true });
+      throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
     }
 
     return skillDir;
