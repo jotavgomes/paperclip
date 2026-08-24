@@ -30,6 +30,11 @@ function generateConnectCode(): string {
  * companyId; there is no ambient "current company" during setup() or a job
  * tick. So every entry point here iterates every company visible to the
  * plugin and skips any that has no bot token configured yet.
+ *
+ * Isolated per company: a `config.get` or polling failure for one company
+ * (this plugin need not even be installed there) is logged and skipped
+ * rather than thrown, so it can't abort polling for every other company on
+ * the same scheduled tick.
  */
 async function forEachConfiguredCompany(
   ctx: PluginContext,
@@ -38,10 +43,24 @@ async function forEachConfiguredCompany(
   const companies = await ctx.companies.list({ limit: 200 });
   for (const company of companies) {
     if (company.status !== "active") continue;
-    const config = await ctx.config.get(company.id);
-    const token = typeof config.botToken === "string" ? config.botToken.trim() : "";
+    let token: string;
+    try {
+      const config = await ctx.config.get(company.id);
+      token = typeof config.botToken === "string" ? config.botToken.trim() : "";
+    } catch (err) {
+      ctx.logger.warn(
+        `telegram-bot-control: could not read config for company "${company.name}" (${company.id}), skipping this tick: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
     if (!token) continue;
-    await fn(company.id, company.name, token);
+    try {
+      await fn(company.id, company.name, token);
+    } catch (err) {
+      ctx.logger.warn(
+        `telegram-bot-control: poll failed for company "${company.name}" (${company.id}), continuing with other companies: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
 
@@ -232,14 +251,17 @@ async function pollUpdates(ctx: PluginContext): Promise<void> {
     await ensureConnectCode(ctx, companyId, companyName);
     const offset = await readOffset(ctx, companyId);
     const updates = await getUpdates(ctx.http, token, offset, POLL_TIMEOUT_SEC);
-    let nextOffset = offset;
+    // Checkpoint after each update, not once for the whole batch: if
+    // handleMessage throws partway through (e.g. a Telegram API error on
+    // one reply), updates already processed earlier in this same batch
+    // stay checkpointed and won't be replayed on the next poll — only the
+    // update that actually failed (and any after it) will be retried.
     for (const update of updates) {
-      nextOffset = Math.max(nextOffset, update.update_id + 1);
+      const nextOffset = update.update_id + 1;
       const message = update.message;
-      if (!message?.text || typeof message.chat?.id !== "number") continue;
-      await handleMessage(ctx, companyId, companyName, token, message.chat.id, message.text);
-    }
-    if (nextOffset !== offset) {
+      if (message?.text && typeof message.chat?.id === "number") {
+        await handleMessage(ctx, companyId, companyName, token, message.chat.id, message.text);
+      }
       await ctx.state.set({ scopeKind: "company", scopeId: companyId, stateKey: OFFSET_STATE_KEY }, nextOffset);
     }
   });

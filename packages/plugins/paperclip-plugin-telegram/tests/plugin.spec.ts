@@ -346,4 +346,67 @@ describe("telegram bot control plugin", () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("polls other companies even when reading config throws for one of them", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({
+      companies: [
+        makeCompany({ id: "company-1", name: "Acme Robotics" }),
+        makeCompany({ id: "company-2", name: "Broken Co" }),
+      ],
+    });
+
+    const originalGet = harness.ctx.config.get.bind(harness.ctx.config);
+    harness.ctx.config.get = async (companyId?: string) => {
+      if (companyId === "company-2") throw new Error("boom: config store unavailable for company-2");
+      return originalGet(companyId);
+    };
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    // company-1 still got its commands registered and polled despite company-2's config blowing up.
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`);
+    expect(
+      harness.logs.some((entry) => entry.message.includes('could not read config for company "Broken Co"')),
+    ).toBe(true);
+  });
+
+  it("checkpoints the offset per message, so a mid-batch failure doesn't replay already-handled updates", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+    const code = await readConnectCode(harness, "company-1");
+
+    // Two /connect attempts in one batch: the first succeeds, the second's
+    // reply (sendMessage) fails outright (simulating a Telegram API error).
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([
+          { update_id: 10, message: { chat: { id: 1 }, text: `/connect acme ${code}` } },
+          { update_id: 11, message: { chat: { id: 2 }, text: "/status" } },
+        ]),
+      )
+      .mockResolvedValueOnce(telegramResponse({})) // sendMessage for update 10 succeeds
+      .mockRejectedValueOnce(new Error("Telegram API unavailable")); // sendMessage for update 11 fails
+
+    await harness.runJob(POLL_JOB_KEY);
+
+    // Update 10 (the successful connect) must not be replayed: offset advanced past it.
+    const storedOffset = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "update-offset",
+    });
+    expect(storedOffset).toBe(11); // update 10's id + 1 — checkpointed before update 11 was attempted and failed
+
+    const linked = await harness.ctx.state.get({ scopeKind: "company", scopeId: "company-1", stateKey: "chat-links" });
+    expect(linked).toEqual([1]); // the first chat's /connect went through before the failure
+  });
 });
