@@ -102,6 +102,8 @@ describe("telegram bot control plugin", () => {
     expect(manifest.capabilities).toContain("http.outbound");
     expect(manifest.capabilities).toContain("companies.read");
     expect(manifest.capabilities).toContain("agents.read");
+    expect(manifest.capabilities).toContain("issues.create");
+    expect(manifest.capabilities).toContain("issues.wakeup");
     expect(manifest.jobs?.[0]?.jobKey).toBe(POLL_JOB_KEY);
   });
 
@@ -131,6 +133,7 @@ describe("telegram bot control plugin", () => {
     expect(JSON.parse(init.body as string).commands).toEqual([
       { command: "connect", description: "Confirm this chat for your company" },
       { command: "status", description: "Show agent status" },
+      { command: "task", description: "Assign a task to an agent" },
     ]);
     expect(harness.logs.some((entry) => entry.message === "Bot commands registered with Telegram")).toBe(true);
   });
@@ -408,5 +411,130 @@ describe("telegram bot control plugin", () => {
 
     const linked = await harness.ctx.state.get({ scopeKind: "company", scopeId: "company-1", stateKey: "chat-links" });
     expect(linked).toEqual([1]); // the first chat's /connect went through before the failure
+  });
+
+  describe("/task", () => {
+    async function connectedHarness() {
+      const harness = createTestHarness({ manifest });
+      harness.setConfig({ botToken: BOT_TOKEN });
+      harness.seed({
+        companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })],
+        agents: [
+          makeAgent({ id: "cto-1", companyId: "company-1", name: "CTO", status: "idle", role: "cto" }),
+          makeAgent({ id: "eng-1", companyId: "company-1", name: "Engineer", status: "idle", role: "general" }),
+        ],
+      });
+      // First poll: no incoming messages, just generates the connect code.
+      fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+      await plugin.definition.setup(harness.ctx);
+      await harness.runJob(POLL_JOB_KEY);
+      const code = await readConnectCode(harness, "company-1");
+
+      // Second poll: actually connect using the generated code.
+      fetchMock
+        .mockResolvedValueOnce(
+          telegramResponse([{ update_id: 1, message: { chat: { id: 42 }, text: `/connect acme ${code}` } }]),
+        )
+        .mockResolvedValueOnce(telegramResponse({}));
+      await harness.runJob(POLL_JOB_KEY);
+      fetchMock.mockClear();
+      return harness;
+    }
+
+    it("creates a task assigned to the CTO by default and wakes it up", async () => {
+      const harness = await connectedHarness();
+      fetchMock
+        .mockResolvedValueOnce(
+          telegramResponse([{ update_id: 2, message: { chat: { id: 42 }, text: "/task fix the login bug" } }]),
+        )
+        .mockResolvedValueOnce(telegramResponse({}));
+
+      await harness.runJob(POLL_JOB_KEY);
+
+      const issues = await harness.ctx.issues.list({ companyId: "company-1" });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.title).toBe("fix the login bug");
+      expect(issues[0]?.assigneeAgentId).toBe("cto-1");
+
+      const replyCall = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(replyCall[0]).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`);
+      const body = JSON.parse(replyCall[1].body as string);
+      expect(body.text).toContain("CTO");
+      expect(body.text).toContain("fix the login bug");
+    });
+
+    it("creates a task assigned to a named agent via @mention", async () => {
+      const harness = await connectedHarness();
+      fetchMock
+        .mockResolvedValueOnce(
+          telegramResponse([
+            { update_id: 2, message: { chat: { id: 42 }, text: "/task @Engineer review the PR" } },
+          ]),
+        )
+        .mockResolvedValueOnce(telegramResponse({}));
+
+      await harness.runJob(POLL_JOB_KEY);
+
+      const issues = await harness.ctx.issues.list({ companyId: "company-1" });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.title).toBe("review the PR");
+      expect(issues[0]?.assigneeAgentId).toBe("eng-1");
+    });
+
+    it("replies with an error and creates no issue for an unknown @mention", async () => {
+      const harness = await connectedHarness();
+      fetchMock
+        .mockResolvedValueOnce(
+          telegramResponse([{ update_id: 2, message: { chat: { id: 42 }, text: "/task @nobody do something" } }]),
+        )
+        .mockResolvedValueOnce(telegramResponse({}));
+
+      await harness.runJob(POLL_JOB_KEY);
+
+      const issues = await harness.ctx.issues.list({ companyId: "company-1" });
+      expect(issues).toHaveLength(0);
+      const replyCall = fetchMock.mock.calls[1] as [string, RequestInit];
+      const body = JSON.parse(replyCall[1].body as string);
+      expect(body.text).toContain("No agent matching");
+    });
+
+    it("asks for a description when /task is sent with no text", async () => {
+      const harness = await connectedHarness();
+      fetchMock
+        .mockResolvedValueOnce(telegramResponse([{ update_id: 2, message: { chat: { id: 42 }, text: "/task" } }]))
+        .mockResolvedValueOnce(telegramResponse({}));
+
+      await harness.runJob(POLL_JOB_KEY);
+
+      const issues = await harness.ctx.issues.list({ companyId: "company-1" });
+      expect(issues).toHaveLength(0);
+      const replyCall = fetchMock.mock.calls[1] as [string, RequestInit];
+      const body = JSON.parse(replyCall[1].body as string);
+      expect(body.text).toContain("Usage: /task");
+    });
+
+    it("rejects /task from a chat that hasn't run /connect yet", async () => {
+      const harness = createTestHarness({ manifest });
+      harness.setConfig({ botToken: BOT_TOKEN });
+      harness.seed({
+        companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })],
+        agents: [makeAgent({ id: "cto-1", companyId: "company-1", name: "CTO", status: "idle", role: "cto" })],
+      });
+      fetchMock
+        .mockResolvedValueOnce(telegramResponse(true))
+        .mockResolvedValueOnce(
+          telegramResponse([{ update_id: 1, message: { chat: { id: 99 }, text: "/task fix it" } }]),
+        )
+        .mockResolvedValueOnce(telegramResponse({}));
+
+      await plugin.definition.setup(harness.ctx);
+      await harness.runJob(POLL_JOB_KEY);
+
+      const issues = await harness.ctx.issues.list({ companyId: "company-1" });
+      expect(issues).toHaveLength(0);
+      const replyCall = fetchMock.mock.calls[2] as [string, RequestInit];
+      const body = JSON.parse(replyCall[1].body as string);
+      expect(body.text).toContain("/connect");
+    });
   });
 });
