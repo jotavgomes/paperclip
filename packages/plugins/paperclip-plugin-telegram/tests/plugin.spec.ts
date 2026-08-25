@@ -573,4 +573,45 @@ describe("telegram bot control plugin", () => {
       ),
     ).toBe(true);
   });
+
+  it("retries the pending-reply queue write itself if it fails, so a compound failure doesn't silently lose the reply", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    // The Telegram send fails twice (a real outage) AND the first attempt to
+    // persist the resulting pending-reply queue entry also fails (a rare,
+    // independent state-store hiccup at the same moment).
+    let pendingWriteAttempts = 0;
+    const originalSet = harness.ctx.state.set.bind(harness.ctx.state);
+    harness.ctx.state.set = async (key: { stateKey: string }, value: unknown) => {
+      if (key.stateKey === "pending-replies") {
+        pendingWriteAttempts++;
+        if (pendingWriteAttempts === 1) {
+          throw new Error("state store temporarily unavailable");
+        }
+      }
+      return originalSet(key, value);
+    };
+
+    fetchMock
+      .mockResolvedValueOnce(telegramResponse([{ update_id: 50, message: { chat: { id: 1 }, text: "/status" } }]))
+      .mockRejectedValueOnce(new Error("still broken"))
+      .mockRejectedValueOnce(new Error("still broken"));
+    await harness.runJob(POLL_JOB_KEY);
+
+    expect(pendingWriteAttempts).toBe(2); // first write failed, the retry succeeded
+    expect(harness.logs.some((entry) => entry.message.includes("failed to handle update 50"))).toBe(false);
+
+    const pending = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    });
+    expect(pending).toEqual([{ chatId: 1, text: expect.any(String) }]);
+  });
 });
