@@ -253,34 +253,112 @@ async function handleTask(
 }
 
 const SEND_RETRY_DELAY_MS = 250;
+const PENDING_REPLIES_STATE_KEY = "pending-replies";
+// Bounds the queue for a company whose bot token has gone bad entirely (every
+// send fails forever) so it doesn't grow without limit. 20 replies at roughly
+// one poll tick per minute is well beyond any outage this bot needs to ride
+// out — past that, the oldest queued replies are dropped and logged.
+const MAX_PENDING_REPLIES = 20;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface PendingReply {
+  chatId: number;
+  text: string;
+}
+
+function pendingRepliesStateKey(companyId: string) {
+  return { scopeKind: "company" as const, scopeId: companyId, stateKey: PENDING_REPLIES_STATE_KEY };
+}
+
+function isPendingReply(value: unknown): value is PendingReply {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as PendingReply).chatId === "number" &&
+    typeof (value as PendingReply).text === "string"
+  );
+}
+
+async function readPendingReplies(ctx: PluginContext, companyId: string): Promise<PendingReply[]> {
+  const stored = await ctx.state.get(pendingRepliesStateKey(companyId));
+  return Array.isArray(stored) ? stored.filter(isPendingReply) : [];
+}
+
+/**
+ * Delivery that survives the immediate retry in sendReplyWithRetry() below
+ * still fails sometimes — an outage longer than a blip, not a one-off. Any
+ * state the command mutated (e.g. /connect consuming its code) is already
+ * committed by this point, so the reply is queued here instead of lost, and
+ * retried on every subsequent poll tick (about once a minute, see
+ * manifest.ts) by flushPendingReplies() until it gets through.
+ */
+async function enqueuePendingReply(ctx: PluginContext, companyId: string, chatId: number, text: string): Promise<void> {
+  const pending = await readPendingReplies(ctx, companyId);
+  pending.push({ chatId, text });
+  const overflow = pending.length - MAX_PENDING_REPLIES;
+  if (overflow > 0) {
+    ctx.logger.warn(
+      `telegram-bot-control: pending reply queue for company ${companyId} exceeded ${MAX_PENDING_REPLIES}, dropping the ${overflow} oldest`,
+    );
+    pending.splice(0, overflow);
+  }
+  await ctx.state.set(pendingRepliesStateKey(companyId), pending);
+}
+
+async function flushPendingReplies(ctx: PluginContext, companyId: string, token: string): Promise<void> {
+  const pending = await readPendingReplies(ctx, companyId);
+  if (pending.length === 0) return;
+  const stillPending: PendingReply[] = [];
+  for (const item of pending) {
+    try {
+      await sendMessage(ctx.http, token, item.chatId, item.text);
+    } catch {
+      stillPending.push(item);
+    }
+  }
+  await ctx.state.set(pendingRepliesStateKey(companyId), stillPending);
+  const delivered = pending.length - stillPending.length;
+  if (delivered > 0) {
+    ctx.logger.info(
+      `telegram-bot-control: delivered ${delivered} previously-queued repl${delivered === 1 ? "y" : "ies"} for company ${companyId}`,
+    );
+  }
 }
 
 /**
  * By the time a reply is ready, any state a command mutates (e.g. /connect
  * consuming its code and linking the chat) is already committed — the
  * offset checkpointing in pollUpdates advances regardless of whether this
- * send succeeds, so a lost reply isn't retried on the next poll. A single
- * transient network blip must not permanently discard the sender's only
- * confirmation that their command went through, so this retries once after
- * a short delay before giving up.
+ * send succeeds, so a lost reply isn't replayed from the same update. A
+ * single transient network blip must not permanently discard the sender's
+ * only confirmation that their command went through: this retries once
+ * immediately, and if that still fails, queues the reply for redelivery on
+ * the next poll tick rather than dropping it.
  */
-async function sendReplyWithRetry(ctx: PluginContext, token: string, chatId: number, reply: string): Promise<void> {
+async function sendReplyWithRetry(
+  ctx: PluginContext,
+  companyId: string,
+  token: string,
+  chatId: number,
+  reply: string,
+): Promise<void> {
   try {
     await sendMessage(ctx.http, token, chatId, reply);
     return;
   } catch {
-    // fall through to the single retry below
+    // fall through to the single immediate retry below
   }
   await sleep(SEND_RETRY_DELAY_MS);
   try {
     await sendMessage(ctx.http, token, chatId, reply);
-  } catch (err) {
-    throw new Error(
-      `reply delivery failed twice, command already applied if it mutated state: ${err instanceof Error ? err.message : String(err)}`,
+  } catch {
+    ctx.logger.warn(
+      `telegram-bot-control: reply delivery failed twice for company ${companyId}, queuing for retry on the next poll`,
     );
+    await enqueuePendingReply(ctx, companyId, chatId, reply);
   }
 }
 
@@ -312,7 +390,7 @@ async function handleMessage(
   } else {
     return;
   }
-  await sendReplyWithRetry(ctx, token, chatId, reply);
+  await sendReplyWithRetry(ctx, companyId, token, chatId, reply);
 }
 
 const COMMANDS_REGISTERED_STATE_KEY = "commands-registered-for-token";
@@ -351,6 +429,7 @@ async function pollUpdates(ctx: PluginContext): Promise<void> {
     sawAnyConfiguredCompany = true;
     await ensureCommandsRegistered(ctx, companyId, token);
     await ensureConnectCode(ctx, companyId, companyName);
+    await flushPendingReplies(ctx, companyId, token);
     const offset = await readOffset(ctx, companyId);
     const updates = await getUpdates(ctx.http, token, offset, POLL_TIMEOUT_SEC);
     // Checkpoint after each update, not once for the whole batch: if
