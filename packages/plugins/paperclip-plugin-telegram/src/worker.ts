@@ -195,11 +195,16 @@ async function handleStatus(ctx: PluginContext, companyId: string, companyName: 
 
 const SEND_RETRY_DELAY_MS = 250;
 const PENDING_REPLIES_STATE_KEY = "pending-replies";
-// Bounds the queue for a company whose bot token has gone bad entirely (every
-// send fails forever) so it doesn't grow without limit. 20 replies at roughly
-// one poll tick per minute is well beyond any outage this bot needs to ride
-// out — past that, the oldest queued replies are dropped and logged.
-const MAX_PENDING_REPLIES = 20;
+// Bounds the queue for a company whose bot token has gone bad entirely
+// (every send fails forever) so it doesn't grow without limit. Deliberately
+// large: dropping the oldest entry can discard a /connect confirmation for
+// state that's already committed, so this cap should only ever bind during
+// a genuinely pathological outage (hundreds of commands piling up across
+// many poll ticks), never during a realistic multi-minute or even
+// multi-hour Telegram disruption. A permanently dead bot token is the one
+// case this doesn't fully protect against — that's an accepted, disclosed
+// limit, not a guarantee of eventual delivery.
+const MAX_PENDING_REPLIES = 200;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
