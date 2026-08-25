@@ -313,6 +313,27 @@ async function enqueuePendingReply(ctx: PluginContext, companyId: string, chatId
   await ctx.state.set(pendingRepliesStateKey(companyId), pending);
 }
 
+/**
+ * The state write above failing at the same moment the Telegram send twice
+ * failed is a rare compound failure, but it's the one case where the reply
+ * is neither delivered nor queued — genuinely lost, not just delayed. A
+ * single retry costs nothing and mirrors the tolerance already applied to
+ * the Telegram send itself; if it still fails, this propagates to the
+ * caller's existing per-update error handling rather than hiding it.
+ */
+async function enqueuePendingReplyWithRetry(
+  ctx: PluginContext,
+  companyId: string,
+  chatId: number,
+  text: string,
+): Promise<void> {
+  try {
+    await enqueuePendingReply(ctx, companyId, chatId, text);
+  } catch {
+    await enqueuePendingReply(ctx, companyId, chatId, text);
+  }
+}
+
 async function flushPendingReplies(ctx: PluginContext, companyId: string, token: string): Promise<void> {
   const pending = await readPendingReplies(ctx, companyId);
   if (pending.length === 0) return;
@@ -363,7 +384,7 @@ async function sendReplyWithRetry(
     ctx.logger.warn(
       `telegram-bot-control: reply delivery failed twice for company ${companyId}, queuing for retry on the next poll`,
     );
-    await enqueuePendingReply(ctx, companyId, chatId, reply);
+    await enqueuePendingReplyWithRetry(ctx, companyId, chatId, reply);
   }
 }
 
