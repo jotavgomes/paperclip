@@ -34,6 +34,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.read",
     "issues.create",
     "issues.wakeup",
+    "activity.log.write",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
