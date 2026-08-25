@@ -177,7 +177,17 @@ describe("telegram bot control plugin", () => {
     await harness.runJob(POLL_JOB_KEY); // generates the connect code, no incoming messages yet
 
     const code = await readConnectCode(harness, "company-1");
-    expect(harness.logs.some((entry) => entry.message.includes(`Telegram connect code for "Acme Robotics": ${code}`))).toBe(true);
+    // The code is disclosed via the company-scoped Activity feed, not
+    // ctx.logger — logger entries carry no company attribution and would be
+    // visible to any board member on the instance, not just this company's.
+    expect(
+      harness.activity.some(
+        (entry) =>
+          (entry as { companyId?: string }).companyId === "company-1" &&
+          entry.message.includes(`Telegram connect code for "Acme Robotics": ${code}`),
+      ),
+    ).toBe(true);
+    expect(harness.logs.some((entry) => entry.message.includes(code))).toBe(false);
 
     fetchMock
       .mockResolvedValueOnce(
