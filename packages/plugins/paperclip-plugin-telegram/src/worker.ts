@@ -193,6 +193,38 @@ async function handleStatus(ctx: PluginContext, companyId: string, companyName: 
   return formatStatus(companyName, agents.map((agent) => agent.status));
 }
 
+const SEND_RETRY_DELAY_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * By the time a reply is ready, any state a command mutates (e.g. /connect
+ * consuming its code and linking the chat) is already committed — the
+ * offset checkpointing in pollUpdates advances regardless of whether this
+ * send succeeds, so a lost reply isn't retried on the next poll. A single
+ * transient network blip must not permanently discard the sender's only
+ * confirmation that their command went through, so this retries once after
+ * a short delay before giving up.
+ */
+async function sendReplyWithRetry(ctx: PluginContext, token: string, chatId: number, reply: string): Promise<void> {
+  try {
+    await sendMessage(ctx.http, token, chatId, reply);
+    return;
+  } catch {
+    // fall through to the single retry below
+  }
+  await sleep(SEND_RETRY_DELAY_MS);
+  try {
+    await sendMessage(ctx.http, token, chatId, reply);
+  } catch (err) {
+    throw new Error(
+      `reply delivery failed twice, command already applied if it mutated state: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 async function handleMessage(
   ctx: PluginContext,
   companyId: string,
@@ -216,7 +248,7 @@ async function handleMessage(
   } else {
     return;
   }
-  await sendMessage(ctx.http, token, chatId, reply);
+  await sendReplyWithRetry(ctx, token, chatId, reply);
 }
 
 const COMMANDS_REGISTERED_STATE_KEY = "commands-registered-for-token";

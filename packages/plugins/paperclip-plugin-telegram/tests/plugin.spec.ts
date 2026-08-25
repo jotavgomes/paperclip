@@ -385,7 +385,8 @@ describe("telegram bot control plugin", () => {
     const code = await readConnectCode(harness, "company-1");
 
     // Two /connect attempts in one batch: the first succeeds, the second's
-    // reply (sendMessage) fails outright (simulating a Telegram API error).
+    // reply (sendMessage) fails outright on both the initial attempt and
+    // the automatic retry (simulating a Telegram outage that outlasts it).
     fetchMock
       .mockResolvedValueOnce(
         telegramResponse([
@@ -394,7 +395,8 @@ describe("telegram bot control plugin", () => {
         ]),
       )
       .mockResolvedValueOnce(telegramResponse({})) // sendMessage for update 10 succeeds
-      .mockRejectedValueOnce(new Error("Telegram API unavailable")); // sendMessage for update 11 fails
+      .mockRejectedValueOnce(new Error("Telegram API unavailable")) // sendMessage for update 11, first attempt
+      .mockRejectedValueOnce(new Error("Telegram API unavailable")); // sendMessage for update 11, retry
 
     await harness.runJob(POLL_JOB_KEY);
 
@@ -435,8 +437,9 @@ describe("telegram bot control plugin", () => {
       .mockResolvedValueOnce(telegramResponse({}));
     await harness.runJob(POLL_JOB_KEY);
 
-    // update 21 fails every single time it's attempted (not a one-off blip) — same
-    // as a permanently malformed message or a permanently broken Telegram call.
+    // update 21 fails every single time it's attempted — both the first send
+    // and the automatic retry — same as a permanently malformed message or a
+    // permanently broken Telegram call, not a one-off transient blip.
     fetchMock
       .mockResolvedValueOnce(
         telegramResponse([
@@ -444,6 +447,7 @@ describe("telegram bot control plugin", () => {
           { update_id: 22, message: { chat: { id: 1 }, text: "/status" } },
         ]),
       )
+      .mockRejectedValueOnce(new Error("permanently broken"))
       .mockRejectedValueOnce(new Error("permanently broken"))
       .mockResolvedValueOnce(telegramResponse({}));
     await harness.runJob(POLL_JOB_KEY);
@@ -458,5 +462,40 @@ describe("telegram bot control plugin", () => {
     expect(
       harness.logs.some((entry) => entry.message.includes("failed to handle update 21")),
     ).toBe(true);
+  });
+
+  it("retries a transient reply-delivery failure once, so a /connect confirmation isn't lost to a single blip", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+    const code = await readConnectCode(harness, "company-1");
+
+    // /connect's state (code consumed, chat linked) is committed before the
+    // reply is sent. The confirmation send fails once — a transient blip —
+    // then succeeds on the automatic retry.
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 30, message: { chat: { id: 1 }, text: `/connect acme ${code}` } }]),
+      )
+      .mockRejectedValueOnce(new Error("temporary network blip"))
+      .mockResolvedValueOnce(telegramResponse({}));
+
+    await harness.runJob(POLL_JOB_KEY);
+
+    // The state change went through regardless...
+    const linked = await harness.ctx.state.get({ scopeKind: "company", scopeId: "company-1", stateKey: "chat-links" });
+    expect(linked).toEqual([1]);
+
+    // ...and, unlike a genuinely persistent failure, the sender still got
+    // their confirmation: no "failed to handle update" was ever logged, and
+    // the retried sendMessage call actually carried the reply text.
+    expect(harness.logs.some((entry) => entry.message.includes("failed to handle update 30"))).toBe(false);
+    const retriedCall = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(retriedCall[0]).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`);
+    expect(JSON.parse(retriedCall[1].body as string).text).toContain('Connected this chat to "Acme Robotics"');
   });
 });
