@@ -374,7 +374,7 @@ describe("telegram bot control plugin", () => {
     ).toBe(true);
   });
 
-  it("checkpoints the offset per message, so a mid-batch failure doesn't replay already-handled updates", async () => {
+  it("checkpoints the offset per message, so a mid-batch failure doesn't replay already-handled updates, and queues the lost reply instead of dropping it", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
@@ -400,9 +400,9 @@ describe("telegram bot control plugin", () => {
 
     await harness.runJob(POLL_JOB_KEY);
 
-    // The offset advances past BOTH updates: 10 succeeded, 11 failed but is
-    // still checkpointed (see the next test — a failing update must not
-    // block every update behind it forever).
+    // The offset advances past BOTH updates: 10 succeeded, 11's reply
+    // couldn't be delivered but the update itself is still checkpointed (see
+    // the next test — a failing send must not block every update behind it).
     const storedOffset = await harness.ctx.state.get({
       scopeKind: "company",
       scopeId: "company-1",
@@ -413,14 +413,22 @@ describe("telegram bot control plugin", () => {
     const linked = await harness.ctx.state.get({ scopeKind: "company", scopeId: "company-1", stateKey: "chat-links" });
     expect(linked).toEqual([1]); // the first chat's /connect went through before the failure
 
+    // Update 11's reply is queued for redelivery, not lost — no "failed to
+    // handle update" log, since the command itself (a plain /status) was
+    // handled fine; only the reply couldn't go out yet.
+    expect(harness.logs.some((entry) => entry.message.includes("failed to handle update 11"))).toBe(false);
     expect(
-      harness.logs.some((entry) =>
-        entry.message.includes("failed to handle update 11") && entry.message.includes("Telegram API unavailable"),
-      ),
+      harness.logs.some((entry) => entry.message.includes("reply delivery failed twice for company company-1")),
     ).toBe(true);
+    const pending = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    });
+    expect(pending).toEqual([{ chatId: 2, text: expect.stringContaining("isn't connected yet") }]);
   });
 
-  it("a consistently failing update is dropped and logged instead of blocking every update behind it", async () => {
+  it("retries a queued reply on the next poll tick until it's delivered, instead of giving up after one outage", async () => {
     const harness = createTestHarness({ manifest });
     harness.setConfig({ botToken: BOT_TOKEN });
     harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
@@ -437,9 +445,9 @@ describe("telegram bot control plugin", () => {
       .mockResolvedValueOnce(telegramResponse({}));
     await harness.runJob(POLL_JOB_KEY);
 
-    // update 21 fails every single time it's attempted — both the first send
-    // and the automatic retry — same as a permanently malformed message or a
-    // permanently broken Telegram call, not a one-off transient blip.
+    // update 21 fails every single time it's attempted within this tick —
+    // both the first send and the automatic retry — simulating an outage
+    // that outlasts a single tick, not a one-off transient blip.
     fetchMock
       .mockResolvedValueOnce(
         telegramResponse([
@@ -452,15 +460,36 @@ describe("telegram bot control plugin", () => {
       .mockResolvedValueOnce(telegramResponse({}));
     await harness.runJob(POLL_JOB_KEY);
 
-    const storedOffset = await harness.ctx.state.get({
+    let storedOffset = await harness.ctx.state.get({
       scopeKind: "company",
       scopeId: "company-1",
       stateKey: "update-offset",
     });
-    expect(storedOffset).toBe(23); // past both 21 (dropped) and 22 (processed) — the queue kept moving
+    expect(storedOffset).toBe(23); // past both 21 (reply queued) and 22 (delivered) — the queue kept moving
 
+    let pending = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    });
+    expect(pending).toEqual([{ chatId: 1, text: expect.any(String) }]);
+
+    // Telegram recovers by the next poll tick. flushPendingReplies() runs
+    // before new updates are even fetched, so the queued reply from update
+    // 21 finally goes out — the outage cost a delay, not the confirmation.
+    fetchMock
+      .mockResolvedValueOnce(telegramResponse({})) // the queued reply, delivered
+      .mockResolvedValueOnce(telegramResponse([])); // no new updates this tick
+    await harness.runJob(POLL_JOB_KEY);
+
+    pending = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    });
+    expect(pending).toEqual([]);
     expect(
-      harness.logs.some((entry) => entry.message.includes("failed to handle update 21")),
+      harness.logs.some((entry) => entry.message.includes("delivered 1 previously-queued reply for company company-1")),
     ).toBe(true);
   });
 
