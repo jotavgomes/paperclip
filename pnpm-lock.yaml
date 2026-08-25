@@ -617,6 +617,25 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@24.13.3)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@7.3.1(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.12))
 
+  packages/plugins/paperclip-plugin-telegram:
+    dependencies:
+      '@paperclipai/plugin-sdk':
+        specifier: workspace:*
+        version: link:../sdk
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      esbuild:
+        specifier: ^0.28.1
+        version: 0.28.2
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.11(@opentelemetry/api@1.9.1)(@types/node@24.13.3)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@7.3.1(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.23.12))
+
   packages/plugins/plugin-llm-wiki:
     dependencies:
       react:
@@ -17094,7 +17113,7 @@ snapshots:
       '@vitest/expect': 3.2.4
       '@vitest/spy': 3.2.4
       '@webcontainer/env': 1.1.1
-      esbuild: 0.28.1
+      esbuild: 0.28.2
       jsonc-parser: 3.3.1
       open: 10.2.0
       oxc-parser: 0.127.0
