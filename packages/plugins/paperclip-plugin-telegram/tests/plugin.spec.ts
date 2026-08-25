@@ -655,4 +655,50 @@ describe("telegram bot control plugin", () => {
     expect(retriedCall[0]).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`);
     expect(JSON.parse(retriedCall[1].body as string).text).toContain('Connected this chat to "Acme Robotics"');
   });
+
+  it("drops the oldest queued reply once the pending queue hits its cap, instead of growing without bound", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    // Pre-fill the queue to its cap (200) directly — driving this many real
+    // failed sends through the poll loop isn't the point of this test, only
+    // what happens on the entry that tips it over. Every sendMessage call
+    // this tick fails (the flush of all 200 pre-seeded entries, then update
+    // 40's immediate send and its retry), so the outage is still ongoing
+    // when the 201st reply tries to enqueue.
+    const alreadyQueued = Array.from({ length: 200 }, (_, i) => ({ chatId: 1, text: `queued-${i}` }));
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: "company-1", stateKey: "pending-replies" },
+      alreadyQueued,
+    );
+
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("/getUpdates")) {
+        return telegramResponse([{ update_id: 40, message: { chat: { id: 1 }, text: "/status" } }]);
+      }
+      throw new Error("still broken"); // every sendMessage call, flush or new
+    });
+    await harness.runJob(POLL_JOB_KEY);
+
+    const pending = (await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    })) as Array<{ chatId: number; text: string }>;
+
+    expect(pending.length).toBe(200); // capped, not 201
+    expect(pending[0].text).toBe("queued-1"); // queued-0 was dropped, the oldest
+    expect(pending.at(-1)?.chatId).toBe(1); // update 40's reply is the newest entry
+
+    expect(
+      harness.logs.some((entry) =>
+        entry.message.includes("pending reply queue for company company-1 exceeded 200, dropping the 1 oldest"),
+      ),
+    ).toBe(true);
+  });
 });
