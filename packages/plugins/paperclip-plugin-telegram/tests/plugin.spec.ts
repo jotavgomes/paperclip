@@ -752,4 +752,60 @@ describe("telegram bot control plugin", () => {
     });
     expect(pending).toEqual([{ chatId: 1, text: expect.any(String) }]);
   });
+
+  it("persists each delivered queue entry's removal immediately, so one failed cleanup write doesn't re-send an already-delivered reply", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+
+    // Two replies already queued from a prior outage.
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: "company-1", stateKey: "pending-replies" },
+      [
+        { chatId: 1, text: "reply-A" },
+        { chatId: 2, text: "reply-B" },
+      ],
+    );
+
+    // The write that removes reply-A after it's delivered succeeds; the
+    // write that removes reply-B after IT's delivered fails. If removals
+    // were batched into one write at the end, this single failure would
+    // re-queue both — the point of this test is that only reply-B does.
+    let pendingWriteAttempts = 0;
+    const originalSet = harness.ctx.state.set.bind(harness.ctx.state);
+    harness.ctx.state.set = async (key: { stateKey: string }, value: unknown) => {
+      if (key.stateKey === "pending-replies") {
+        pendingWriteAttempts++;
+        if (pendingWriteAttempts === 2) {
+          throw new Error("state store temporarily unavailable");
+        }
+      }
+      return originalSet(key, value);
+    };
+
+    fetchMock
+      .mockResolvedValueOnce(telegramResponse({})) // reply-A delivered
+      .mockResolvedValueOnce(telegramResponse({})) // reply-B delivered
+      .mockResolvedValueOnce(telegramResponse([])); // no new updates this tick
+    await harness.runJob(POLL_JOB_KEY);
+
+    // Both sends went out exactly once each — delivery itself isn't retried
+    // or duplicated within this tick.
+    const sendCalls = fetchMock.mock.calls.filter(([url]) => (url as string).includes("/sendMessage"));
+    expect(sendCalls.length).toBe(2);
+
+    // reply-A's removal was persisted before reply-B's write ever failed, so
+    // only reply-B is still sitting in the queue (to be retried next tick —
+    // not resent, since it was never actually confirmed delivered).
+    const pending = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "pending-replies",
+    });
+    expect(pending).toEqual([{ chatId: 2, text: "reply-B" }]);
+  });
 });

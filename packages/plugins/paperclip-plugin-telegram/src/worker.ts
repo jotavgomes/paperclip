@@ -350,16 +350,23 @@ async function enqueuePendingReplyWithRetry(
 async function flushPendingReplies(ctx: PluginContext, companyId: string, token: string): Promise<void> {
   const pending = await readPendingReplies(ctx, companyId);
   if (pending.length === 0) return;
-  const stillPending: PendingReply[] = [];
+  // Removed and persisted one at a time, right after each successful send —
+  // not batched into a single write at the end. A batched write means a
+  // state-store failure after N successful sends re-queues all N for resend
+  // next tick (duplicate delivery); persisting incrementally limits that
+  // blast radius to at most the one item whose own removal write failed.
+  let remaining = pending;
+  let delivered = 0;
   for (const item of pending) {
     try {
       await sendMessage(ctx.http, token, item.chatId, item.text);
     } catch {
-      stillPending.push(item);
+      continue;
     }
+    remaining = remaining.filter((r) => r !== item);
+    await ctx.state.set(pendingRepliesStateKey(companyId), remaining);
+    delivered++;
   }
-  await ctx.state.set(pendingRepliesStateKey(companyId), stillPending);
-  const delivered = pending.length - stillPending.length;
   if (delivered > 0) {
     ctx.logger.info(
       `telegram-bot-control: delivered ${delivered} previously-queued repl${delivered === 1 ? "y" : "ies"} for company ${companyId}`,
