@@ -398,15 +398,65 @@ describe("telegram bot control plugin", () => {
 
     await harness.runJob(POLL_JOB_KEY);
 
-    // Update 10 (the successful connect) must not be replayed: offset advanced past it.
+    // The offset advances past BOTH updates: 10 succeeded, 11 failed but is
+    // still checkpointed (see the next test — a failing update must not
+    // block every update behind it forever).
     const storedOffset = await harness.ctx.state.get({
       scopeKind: "company",
       scopeId: "company-1",
       stateKey: "update-offset",
     });
-    expect(storedOffset).toBe(11); // update 10's id + 1 — checkpointed before update 11 was attempted and failed
+    expect(storedOffset).toBe(12); // update 11's id + 1
 
     const linked = await harness.ctx.state.get({ scopeKind: "company", scopeId: "company-1", stateKey: "chat-links" });
     expect(linked).toEqual([1]); // the first chat's /connect went through before the failure
+
+    expect(
+      harness.logs.some((entry) =>
+        entry.message.includes("failed to handle update 11") && entry.message.includes("Telegram API unavailable"),
+      ),
+    ).toBe(true);
+  });
+
+  it("a consistently failing update is dropped and logged instead of blocking every update behind it", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.setConfig({ botToken: BOT_TOKEN });
+    harness.seed({ companies: [makeCompany({ id: "company-1", name: "Acme Robotics" })] });
+
+    fetchMock.mockResolvedValueOnce(telegramResponse(true)).mockResolvedValueOnce(telegramResponse([]));
+    await plugin.definition.setup(harness.ctx);
+    await harness.runJob(POLL_JOB_KEY);
+    const code = await readConnectCode(harness, "company-1");
+
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([{ update_id: 20, message: { chat: { id: 1 }, text: `/connect acme ${code}` } }]),
+      )
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+
+    // update 21 fails every single time it's attempted (not a one-off blip) — same
+    // as a permanently malformed message or a permanently broken Telegram call.
+    fetchMock
+      .mockResolvedValueOnce(
+        telegramResponse([
+          { update_id: 21, message: { chat: { id: 1 }, text: "/status" } },
+          { update_id: 22, message: { chat: { id: 1 }, text: "/status" } },
+        ]),
+      )
+      .mockRejectedValueOnce(new Error("permanently broken"))
+      .mockResolvedValueOnce(telegramResponse({}));
+    await harness.runJob(POLL_JOB_KEY);
+
+    const storedOffset = await harness.ctx.state.get({
+      scopeKind: "company",
+      scopeId: "company-1",
+      stateKey: "update-offset",
+    });
+    expect(storedOffset).toBe(23); // past both 21 (dropped) and 22 (processed) — the queue kept moving
+
+    expect(
+      harness.logs.some((entry) => entry.message.includes("failed to handle update 21")),
+    ).toBe(true);
   });
 });

@@ -254,13 +254,27 @@ async function pollUpdates(ctx: PluginContext): Promise<void> {
     // Checkpoint after each update, not once for the whole batch: if
     // handleMessage throws partway through (e.g. a Telegram API error on
     // one reply), updates already processed earlier in this same batch
-    // stay checkpointed and won't be replayed on the next poll — only the
-    // update that actually failed (and any after it) will be retried.
+    // stay checkpointed and won't be replayed on the next poll.
+    //
+    // The offset always advances, even when handleMessage throws. A
+    // consistently-failing update (not a transient blip, but one that
+    // fails the same way every time — a malformed message, a permanent
+    // Telegram API error) would otherwise never get past, and since
+    // getUpdates only returns updates at-or-after the stored offset, that
+    // one poison update would block every update behind it forever. Log
+    // the failure so it's visible, then move on: a dropped reply is a
+    // better failure mode for a bot than a permanently stuck queue.
     for (const update of updates) {
       const nextOffset = update.update_id + 1;
       const message = update.message;
       if (message?.text && typeof message.chat?.id === "number") {
-        await handleMessage(ctx, companyId, companyName, token, message.chat.id, message.text);
+        try {
+          await handleMessage(ctx, companyId, companyName, token, message.chat.id, message.text);
+        } catch (err) {
+          ctx.logger.warn(
+            `telegram-bot-control: failed to handle update ${update.update_id} for company "${companyName}", skipping it: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
       await ctx.state.set({ scopeKind: "company", scopeId: companyId, stateKey: OFFSET_STATE_KEY }, nextOffset);
     }
